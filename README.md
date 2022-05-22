@@ -30,4 +30,4 @@ This version is compatible with any PHP project. It autodetects Keimenno, Wordpr
   lykan::run(dirname(__FILE__));
 ```
  
-The keimenbo CMS includes the LykanShield project already. It is in the core implemented.
+The keimeno CMS includes the LykanShield project already. It is in the core implemented.
