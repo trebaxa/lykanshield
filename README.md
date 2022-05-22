@@ -1,4 +1,4 @@
-# LykannShield
+# LykanShield
 ## Blocks SQL Injection, bad bots, bad IPs and different filter like mime filter.
 
 **Join our global network to protect your pages from hackers.** 
