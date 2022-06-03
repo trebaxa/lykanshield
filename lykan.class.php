@@ -32,7 +32,6 @@
 
 # define subpath of your project. last char must be a /
 define('SUB_PATH_OF_SYSTEM', '/');
-date_default_timezone_set('Europe/Berlin');
 
 class lykan_config {
     public static $config = array(
@@ -45,6 +44,7 @@ class lykan_config {
             'mime_types' => true, #activates mime filter
             'file_inject' => true, # file injection filter
             'bad_bots' => true, # bad bot filter
+            'bad_user_post' => true, # bad user post
             'bad_ips' => true, # bad IP filter
             'sql_injection' => true, # SQL Injection filter
             ),
@@ -191,7 +191,7 @@ class lykan {
         if (lykan_config::$config['filter_active']['file_inject'] === true) {
             $ext = end((explode(".", $name)));
             if (in_array($ext, lykan_config::$config['forbidden_file_ext']) || preg_match("/^.*\.([a-zA-Z]{3}).html$/", $name) || preg_match("/^.*\.([a-zA-Z]{3}).htm$/", $name)) {
-                self::report_hack(lykan_types::FILE_INJECT, $ext);
+                self::report_hack(lykan_types::FILE_INJECT, $ext, false);
                 self::exit_env(lykan_types::FILE_INJECT . ' ' . $ext);
             }
         }
@@ -216,7 +216,7 @@ class lykan {
                     return;
                 }
             }
-            self::report_hack(lykan_types::MIME_FILE_UPLOAD, $file["type"]);
+            self::report_hack(lykan_types::MIME_FILE_UPLOAD, $file["type"], false);
             self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' ' . $file["type"]);
         }
     }
@@ -277,6 +277,7 @@ class lykan {
             date('Y-m-d H:i:s'),
             )));
 
+        self::block_bad_user_post();
         self::file_upload_protection();
         self::block_bad_bots();
         self::block_bad_ips();
@@ -295,6 +296,21 @@ class lykan {
     }
 
     /**
+     * lykan::block_bad_user_post()
+     * 
+     * @return void
+     */
+    protected static function block_bad_user_post() {
+        return;
+        if (lykan_config::$config['filter_active']['bad_user_post'] === true) {
+            if ($_SERVER['REQUEST_METHOD'] == 'POST' && empty($_SERVER['HTTP_USER_AGENT']) && empty($_SERVER['HTTP_REFERER'])) {
+                self::report_hack(lykan_types::BAD_USER_POST, "POST with blank user-agent and referer");
+                self::exit_env(lykan_types::BAD_USER_POST . ' ' . $row['i_ip']);
+            }
+        }
+    }
+
+    /**
      * lykan::block_ips_and_bots_from_blacklist()
      * blocks IPs and bots save manually by backend
      * @return void
@@ -303,11 +319,11 @@ class lykan {
         $user_agent = self::get_user_agent();
         $json = json_decode(self::get_current_pattern(), true);
 
-        # check bad IPs
+        # check bad IPs ( include IPs from stock DB and lykan network )
         $json['badips'] = (array )$json['badips'];
         if (isset($json['badips'][self::get_the_ip()])) {
-            self::report_hack(lykan_types::BAD_LOCAL_IP, "", false);
-            self::exit_env(lykan_types::BAD_LOCAL_IP . ' ' . $row['i_ip']);
+            self::report_hack(lykan_types::BAD_IP, "", false);
+            self::exit_env(lykan_types::BAD_IP . ' ' . $row['i_ip']);
         }
 
         #check bots
@@ -450,7 +466,7 @@ class lykan {
 
     /**
      * lykan::block_bad_ips()
-     * 
+     * locale stored bad ips
      * @return void
      */
     protected static function block_bad_ips() {
@@ -464,7 +480,7 @@ class lykan {
                     'IP',
                     self::get_the_ip())) . PHP_EOL);
                 fclose($fp);
-                self::report_hack(lykan::BAD_IP, self::get_the_ip());
+                self::report_hack(lykan::BAD_IP, self::get_the_ip(), false);
                 self::exit_env(lykan::BAD_IP);
             }
         }
@@ -657,17 +673,13 @@ class lykan {
         $arr = array(
             'cmd' => 'report_hack',
             'adddb' => $adddb,
+            'user_agent' => self::get_user_agent(),
             'FORM' => array(
                 'type' => $h_type,
-                'type_info' => 'HL ' . $h_type_info,
+                'type_info' => $h_type_info,
                 'domain' => self::get_host(),
                 'ip' => self::get_the_ip(),
                 'url' => base64_encode($_SERVER['PHP_SELF'] . '###' . $_SERVER['QUERY_STRING'] . '###' . http_build_query($_REQUEST)),
-                ),
-            'FORM_IP' => array(
-                'b_iphash' => md5(self::get_the_ip()),
-                'b_ua' => self::get_user_agent(),
-                'b_ip' => self::get_the_ip(),
                 ));
         return lykan_client::call('POST', $arr);
     }
@@ -686,7 +698,7 @@ class lykan {
             'days' => $days,
             'limit' => (int)$limit,
             'domain' => $domain,
-            'khash' => hash('sha256', $domain . $days . date('YmdHi')));
+            'khash' => hash('sha256', $domain . $days . lykan::get_timestamp()));
         $str = lykan_client::call('POST', $arr);
         return json_decode($str, true);
     }
@@ -713,7 +725,15 @@ class lykan {
             json_encode(array());
     }
 
-
+    /**
+     * lykan::get_timestamp()
+     * 
+     * @return
+     */
+    public static function get_timestamp() {
+        $now = new DateTime("now", new DateTimeZone('CET'));
+        return date('YmdHi', strtotime($now->format('Y-m-d H:i:s')) - $now->format('Z'));
+    }
 }
 
 class lykan_client {
@@ -731,10 +751,11 @@ class lykan_client {
         $url = static::$endpoint;
         $data['apikey'] = (lykan_config::$config['apikey'] != "") ? lykan_config::$config['apikey'] : "";
         $data['host'] = lykan::get_host();
-        $data['hash'] = hash('sha512', implode(':', [$data['apikey'], $data['host'], date('Ymdhi')]));
+        $data['hash'] = hash('sha512', implode(':', [$data['apikey'], $data['host'], lykan::get_timestamp()]));
         $data = json_encode($data);
 
         $curl = curl_init();
+        curl_setopt($curl, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) Gecko/20100101 Firefox/100.0');
         switch ($method) {
             case "POST":
                 curl_setopt($curl, CURLOPT_POST, 1);
@@ -784,6 +805,7 @@ class lykan_types {
     CONST SQL_INJECT = 'SQL_INJECT';
     CONST DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
     CONST FILE_INJECT = 'FILE_INJECT';
+    CONST BAD_USER_POST = 'BAD_USER_POST';
     CONST BLACK_LIST_BOT = 'BLACK_LIST_BOT';
     CONST INVALID_USER_AGENT = 'INVALID_USER_AGENT';
     CONST WORM_INJECT = 'WORM_INJECT';
