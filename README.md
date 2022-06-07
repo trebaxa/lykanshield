@@ -33,10 +33,10 @@ This version is compatible with any PHP project. It autodetects Keimeno, Wordpre
 The keimeno CMS includes the LykanShield project already. It is in the core implemented.
 
 ### Embed via IFRAME in your backend dashboard
-** register on https://www.lykanshield.io/register.html and use our assistant to generate your iframe code. Very simple way.
+**register on https://www.lykanshield.io/register.html and use our assistant to generate your iframe code. Very simple way.**
 
 ### Get information via API into your backend dashboard
-** this JSON string includes data to create an chart or tables with IP information for your dashboard
+**this JSON string includes data to create an chart or tables with IP information for your dashboard**
 ```php
   <?PHP
   require ('./includes/lykan.class.php');
