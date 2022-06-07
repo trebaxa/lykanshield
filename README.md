@@ -19,7 +19,7 @@ This project should help us developer to protect our PHP projects from hacking. 
 and hlock updates hisself with a current list of bad ips, bots and SQL injection rules.
 Be part of the network and help us to get the web safer!
  
-This version is compatible with any PHP project. It autodetects Keimenno, Wordpress, Joomla and Typo3.
+This version is compatible with any PHP project. It autodetects Keimeno, Wordpress, Joomla and Typo3.
  
 ### Quick implementation
 **add in your project index.php:**
@@ -32,7 +32,11 @@ This version is compatible with any PHP project. It autodetects Keimenno, Wordpr
  
 The keimeno CMS includes the LykanShield project already. It is in the core implemented.
 
+### Embed via IFRAME
+** register on https://www.lykanshield.io/register.html and use our assistant to generate your iframe code. Very simple way.
+
 ### Get information via API
+** this JSON string includes data to create an chart or tables with IP information for your dashboard
 ```php
   <?PHP
   require ('./includes/lykan.class.php');
