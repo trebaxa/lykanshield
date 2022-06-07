@@ -31,3 +31,12 @@ This version is compatible with any PHP project. It autodetects Keimenno, Wordpr
 ```
  
 The keimeno CMS includes the LykanShield project already. It is in the core implemented.
+
+### Get information via API
+```php
+  <?PHP
+  require ('./includes/lykan.class.php');
+  /* function get_lock(DAYS_BACK) */
+  $json_string = lykan::get_lock(30);
+  var_dump(json_decode($json_string, true));
+```
