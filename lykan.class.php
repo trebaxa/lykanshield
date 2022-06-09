@@ -47,6 +47,7 @@ class lykan_config {
             'bad_user_post' => true, # bad user post
             'bad_ips' => true, # bad IP filter
             'sql_injection' => true, # SQL Injection filter
+            'worm_injection' => true, # WORM Injection filter
             ),
         # forbidden file extentions on file upload
         'forbidden_file_ext' => array(
@@ -77,7 +78,7 @@ class lykan {
         # default
         self::set_config_arr(array(
             'hpath' => static::$lykan_root . 'lykan/accesslog/',
-            'sub_folder' => static::$lykan_root . 'lykan/',
+            'root' => static::$lykan_root . 'lykan/',
             'lykan_blocked_file' => static::$lykan_root . 'lykan/hacklogblock_' . static::$host . '.txt',
             'lykan_blacklist' => static::$lykan_root . 'lykan/blacklist.json',
             'badips_file' => static::$lykan_root . 'lykan/badips_' . static::$host . '.txt',
@@ -88,7 +89,7 @@ class lykan {
         if (is_dir(static::$lykan_root . 'admin') && is_file(static::$lykan_root . 'admin/inc/keimeno.class.php')) {
             self::set_config_arr(array(
                 'hpath' => static::$lykan_root . 'includes/lib/lykan/accesslog/',
-                'sub_folder' => static::$lykan_root . 'includes/lib/lykan/',
+                'root' => static::$lykan_root . 'includes/lib/lykan/',
                 'lykan_blocked_file' => static::$lykan_root . 'includes/lib/lykan/hacklogblock_' . static::$host . '.txt',
                 'lykan_blacklist' => static::$lykan_root . 'includes/lib/lykan/blacklist.json',
                 'badips_file' => static::$lykan_root . 'includes/lib/lykan/badips_' . static::$host . '.txt',
@@ -99,7 +100,7 @@ class lykan {
         # detect WordPress
         if (is_dir(static::$lykan_root . 'wp-admin')) {
             self::set_config_arr(array(
-                'sub_folder' => static::$lykan_root . 'wp-content/lykan/',
+                'root' => static::$lykan_root . 'wp-content/lykan/',
                 'hpath' => static::$lykan_root . 'wp-content/lykan/accesslog/',
                 'lykan_blocked_file' => static::$lykan_root . 'wp-content/lykan/hacklogblock_' . static::$host . '.txt',
                 'lykan_blacklist' => static::$lykan_root . 'wp-content/lykan/blacklist.json',
@@ -111,7 +112,7 @@ class lykan {
         #detect TYPO3
         if (is_dir(static::$lykan_root . 'fileadmin') && is_dir(static::$lykan_root . 'typo3conf')) {
             self::set_config_arr(array(
-                'sub_folder' => static::$lykan_root . 'fileadmin/lykan/',
+                'root' => static::$lykan_root . 'fileadmin/lykan/',
                 'hpath' => static::$lykan_root . 'fileadmin/lykan/accesslog/',
                 'lykan_blocked_file' => static::$lykan_root . 'fileadmin/lykan/hacklogblock_' . static::$host . '.txt',
                 'lykan_blacklist' => static::$lykan_root . 'fileadmin/lykan/blacklist.json',
@@ -120,8 +121,8 @@ class lykan {
                 ));
         }
 
-        if (!is_dir(lykan_config::$config['sub_folder']))
-            mkdir(lykan_config::$config['sub_folder'], 0755);
+        if (!is_dir(lykan_config::$config['root']))
+            mkdir(lykan_config::$config['root'], 0755);
         if (!is_dir(lykan_config::$config['hpath']))
             mkdir(lykan_config::$config['hpath'], 0755);
     }
@@ -167,6 +168,53 @@ class lykan {
     }
 
     /**
+     * lykan::is_valid_json()
+     * 
+     * @param mixed $str
+     * @return
+     */
+    protected static function is_valid_json($str) {
+        json_decode($str);
+        return json_last_error() == JSON_ERROR_NONE;
+    }
+
+    /**
+     * lykan::load_config()
+     * 
+     * @return void
+     */
+    public static function load_config() {
+        $conf_file = self::get_root() . 'config.json';
+        if (is_file($conf_file)) {
+            $json = file_get_contents($conf_file);
+            if (self::is_valid_json($json)) {
+                $arr = json_decode($json, true);
+                lykan_config::$config = array_merge(lykan_config::$config, $arr);
+            }
+        }
+        return lykan_config::$config;
+    }
+
+    /**
+     * lykan::save_config()
+     * 
+     * @param mixed $arr
+     * @return void
+     */
+    public static function save_config(array $arr) {
+        file_put_contents(self::get_root() . 'config.json', json_encode($arr));
+    }
+
+    /**
+     * lykan::get_root()
+     * 
+     * @return
+     */
+    public static function get_root() {
+        return lykan_config::$config['root'];
+    }
+
+    /**
      * lykan::set_root()
      * 
      * @param mixed $path
@@ -188,7 +236,7 @@ class lykan {
      * @return void
      */
     public static function check_filename($name) {
-        if (lykan_config::$config['filter_active']['file_inject'] === true) {
+        if (self::is_filter_active('file_inject') === true) {
             $ext = end((explode(".", $name)));
             if (in_array($ext, lykan_config::$config['forbidden_file_ext']) || preg_match("/^.*\.([a-zA-Z]{3}).html$/", $name) || preg_match("/^.*\.([a-zA-Z]{3}).htm$/", $name)) {
                 self::report_hack(lykan_types::FILE_INJECT, $ext, false);
@@ -197,6 +245,15 @@ class lykan {
         }
     }
 
+    /**
+     * lykan::is_filter_active()
+     * 
+     * @param mixed $type
+     * @return
+     */
+    private static function is_filter_active($type) {
+        return isset(lykan_config::$config['filter_active'][$type]) && (boolean)lykan_config::$config['filter_active'][$type] === true;
+    }
 
     /**
      * lykan::check_mime()
@@ -208,7 +265,7 @@ class lykan {
         if (!isset($file["type"])) {
             return;
         }
-        if (lykan_config::$config['filter_active']['mime_types'] == true) {
+        if (self::is_filter_active('mime_types') === true) {
             $json = json_decode(self::get_current_pattern(), true);
             $json['mime'] = (array )$json['mime'];
             foreach ($json['mime'] as $mime => $ext) {
@@ -245,14 +302,23 @@ class lykan {
     }
 
     /**
+     * lykan::init()
+     * 
+     * @return void
+     */
+    public static function init($path) {
+        self::set_root($path);
+        self::auto_detect_system();
+    }
+
+    /**
      * lykan::run()
      * 
      * @return void
      */
     public static function run($path = "") {
-        self::set_root($path);
-        self::auto_detect_system();
-
+        self::init($path);
+        self::load_config();
         if ($handle = opendir(lykan_config::$config['hpath'])) {
             while (false !== ($file = readdir($handle))) {
                 if ((integer)(time() - filemtime(lykan_config::$config['hpath'] . $file)) > (lykan_config::$config['hcache_lifetime_hours'] * 3600) && $file !== '.' && $file
@@ -281,7 +347,8 @@ class lykan {
         self::file_upload_protection();
         self::block_bad_bots();
         self::block_bad_ips();
-        self::detect_sqlinjection();
+        self::worm_detect();
+        self::sql_detect();
         self::clear_blocked();
         self::block_ips_and_bots_from_blacklist();
         #self::check_agent();
@@ -302,7 +369,7 @@ class lykan {
      */
     protected static function block_bad_user_post() {
         return;
-        if (lykan_config::$config['filter_active']['bad_user_post'] === true) {
+        if (self::is_filter_active('bad_user_post') === true) {
             if ($_SERVER['REQUEST_METHOD'] == 'POST' && empty($_SERVER['HTTP_USER_AGENT']) && empty($_SERVER['HTTP_REFERER'])) {
                 self::report_hack(lykan_types::BAD_USER_POST, "POST with blank user-agent and referer");
                 self::exit_env(lykan_types::BAD_USER_POST . ' ' . $row['i_ip']);
@@ -343,7 +410,7 @@ class lykan {
      * @return void
      */
     protected static function block_bad_bots() {
-        if (lykan_config::$config['filter_active']['bad_bots'] == true) {
+        if (self::is_filter_active('bad_bots') === true) {
             $badbots = self::read_bad_bots_from_cachefile();
             if ($_SERVER['HTTP_USER_AGENT'] != str_ireplace($badbots, '*', $_SERVER['HTTP_USER_AGENT'])) {
                 $fp = fopen(lykan_config::$config['lykan_blocked_file'], 'a+');
@@ -470,7 +537,7 @@ class lykan {
      * @return void
      */
     protected static function block_bad_ips() {
-        if (lykan_config::$config['filter_active']['bad_ips'] == true) {
+        if (self::is_filter_active('bad_ips') === true) {
             $badips = self::get_bad_ips();
             if (in_array(self::get_the_ip(), $badips)) {
                 $fp = fopen(lykan_config::$config['lykan_blocked_file'], 'a+');
@@ -616,31 +683,52 @@ class lykan {
     }
 
     /**
-     * lykan::detect_sqlinjection()
+     * lykan::worm_detect()
      * 
      * @return void
      */
-    public static function detect_sqlinjection() {
-        if (lykan_config::$config['filter_active']['sql_injection'] == true) {
+    private static function worm_detect() {
+        self::detect_injection('worm', lykan_types::WORM_INJECT);
+    }
+
+    /**
+     * lykan::sql_detect()
+     * 
+     * @return void
+     */
+    private static function sql_detect() {
+        self::detect_injection('sql', lykan_types::SQL_INJECT);
+    }
+
+
+    /**
+     * lykan::detect_injection()
+     * 
+     * @param mixed $type
+     * @param mixed $itype
+     * @return void
+     */
+    public static function detect_injection($type, $itype) {
+        if (self::is_filter_active($type . '_injection') === true) {
             $cracktrack = self::get_query_string();
             $json = json_decode(self::get_current_pattern(), true);
-            foreach ((array )$json['sqlinject'] as $row) {
-                $wormprotector[] = $row['i_term'];
+            foreach ((array )$json[$type . 'inject'] as $row) {
+                $pattern[] = $row['i_term'];
             }
 
-            $checkworm = str_ireplace($wormprotector, '*', $cracktrack);
-            if ($cracktrack != $checkworm) {
+            $check = str_ireplace($pattern, '*', $cracktrack);
+            if ($cracktrack != $check) {
                 self::add_ip(self::get_the_ip());
-                self::report_hack(lykan_types::SQL_INJECT);
+                self::report_hack($itype);
                 if (filter_var(static::$email, FILTER_VALIDATE_EMAIL)) {
-                    $mail_msg = 'Hacking blocked [SQLINJECTION]: ' . PHP_EOL;
+                    $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]: ' . PHP_EOL;
                     $arr = array(
                         'IP' => self::get_the_ip(),
                         'Host' => self::get_host(),
                         'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . self::get_the_ip(),
                         'HTTP_USER_AGENT' => $_SERVER['HTTP_USER_AGENT'],
                         'cracktrack' => $cracktrack,
-                        "Hacked" => $checkworm);
+                        "Hacked" => $check);
                     foreach ($arr as $key => $value) {
                         $mail_msg .= $key . ":\t" . $value . PHP_EOL;
                     }
@@ -684,11 +772,13 @@ class lykan {
         return lykan_client::call('POST', $arr);
     }
 
+
     /**
      * lykan::get_lock()
      * 
      * @param mixed $days
-     * @return void
+     * @param integer $limit
+     * @return
      */
     public static function get_lock($days, $limit = 0) {
         $domain = self::get_host();
