@@ -547,8 +547,8 @@ class lykan {
                     'IP',
                     self::get_the_ip())) . PHP_EOL);
                 fclose($fp);
-                self::report_hack(lykan::BAD_IP, self::get_the_ip(), false);
-                self::exit_env(lykan::BAD_IP);
+                self::report_hack(lykan_types::BAD_IP, self::get_the_ip(), false);
+                self::exit_env(lykan_types::BAD_IP);
             }
         }
     }
@@ -612,25 +612,6 @@ class lykan {
             );
     }
 
-    /**
-     * lykan::save()
-     * 
-     * @return void
-     */
-    public function save() {
-        $ip_list = array();
-        $FORM = (array )$_POST['FORM'];
-        $arr = explode(PHP_EOL, stripslashes($FORM['bad_ips']));
-        foreach ($arr as $ip) {
-            $ip = trim($ip);
-            if (self::is_valid_ip($ip)) {
-                $ip_list[] = $ip;
-            }
-        }
-        $ip_list = array_unique($ip_list);
-        file_put_contents(lykan_config::$config['badips_file'], trim(implode(PHP_EOL, $ip_list)));
-        file_put_contents(lykan_config::$config['badbots_file'], stripslashes($FORM['bad_bots']));
-    }
 
     /**
      * lykan::add_ip()
@@ -689,6 +670,15 @@ class lykan {
      */
     private static function worm_detect() {
         self::detect_injection('worm', lykan_types::WORM_INJECT);
+        $check = $cracktrack = self::get_query_string();
+        $json = json_decode(self::get_current_pattern(), true);
+        foreach ((array )$json['xssinject'] as $row) {
+            $cracktrack = preg_replace((string )$row['i_term'], '*', $cracktrack);
+        }
+        if ($cracktrack != $check) {
+            self::report_hack(lykan_types::XSS_INJECT);
+            self::exit_env(lykan_types::XSS_INJECT);
+        }
     }
 
     /**
@@ -720,7 +710,7 @@ class lykan {
             if ($cracktrack != $check) {
                 self::add_ip(self::get_the_ip());
                 self::report_hack($itype);
-                if (filter_var(static::$email, FILTER_VALIDATE_EMAIL)) {
+                if (filter_var(lykan_config::$config['email'], FILTER_VALIDATE_EMAIL)) {
                     $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]: ' . PHP_EOL;
                     $arr = array(
                         'IP' => self::get_the_ip(),
@@ -895,6 +885,7 @@ class lykan_types {
     CONST SQL_INJECT = 'SQL_INJECT';
     CONST DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
     CONST FILE_INJECT = 'FILE_INJECT';
+    CONST XSS_INJECT = 'XSS_INJECT';
     CONST BAD_USER_POST = 'BAD_USER_POST';
     CONST BLACK_LIST_BOT = 'BLACK_LIST_BOT';
     CONST INVALID_USER_AGENT = 'INVALID_USER_AGENT';
