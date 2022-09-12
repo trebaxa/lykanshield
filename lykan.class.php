@@ -396,11 +396,13 @@ class lykan {
         }
 
         #check bots
-        foreach ((array )$json['bots'] as $row) {
-            $bot_key = trim(strtolower($row['b_bot']));
-            if (!empty($bot_key) && strstr($user_agent, $bot_key)) {
-                self::report_hack(lykan_types::BLACK_LIST_BOT, "", false);
-                self::exit_env('BLACK_LIST_BOT');
+        if (isset($json['bots']) && is_array($json['bots'])) {
+            foreach ((array )$json['bots'] as $row) {
+                $bot_key = trim(strtolower($row['b_bot']));
+                if (!empty($bot_key) && strstr($user_agent, $bot_key)) {
+                    self::report_hack(lykan_types::BLACK_LIST_BOT, "", false);
+                    self::exit_env('BLACK_LIST_BOT');
+                }
             }
         }
     }
@@ -674,12 +676,14 @@ class lykan {
         self::detect_injection('worm', lykan_types::WORM_INJECT);
         $check = $cracktrack = self::get_query_string();
         $json = json_decode(self::get_current_pattern(), true);
-        foreach ((array )$json['xssinject'] as $row) {
-            $cracktrack = preg_replace((string )$row['i_term'], '*', $cracktrack);
-        }
-        if ($cracktrack != $check) {
-            self::report_hack(lykan_types::XSS_INJECT);
-            self::exit_env(lykan_types::XSS_INJECT);
+        if (isset($json['xssinject']) && is_array($json['xssinject'])) {
+            foreach ((array )$json['xssinject'] as $row) {
+                $cracktrack = preg_replace((string )$row['i_term'], '*', $cracktrack);
+            }
+            if ($cracktrack != $check) {
+                self::report_hack(lykan_types::XSS_INJECT);
+                self::exit_env(lykan_types::XSS_INJECT);
+            }
         }
     }
 
@@ -704,30 +708,32 @@ class lykan {
         if (self::is_filter_active($type . '_injection') === true) {
             $cracktrack = self::get_query_string();
             $json = json_decode(self::get_current_pattern(), true);
-            foreach ((array )$json[$type . 'inject'] as $row) {
-                $pattern[] = $row['i_term'];
-            }
-
-            $check = str_ireplace($pattern, '*', $cracktrack);
-            if ($cracktrack != $check) {
-                self::add_ip(self::get_the_ip());
-                self::report_hack($itype);
-                if (filter_var(lykan_config::$config['email'], FILTER_VALIDATE_EMAIL)) {
-                    $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]: ' . PHP_EOL;
-                    $arr = array(
-                        'IP' => self::get_the_ip(),
-                        'Host' => self::get_host(),
-                        'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . self::get_the_ip(),
-                        'HTTP_USER_AGENT' => $_SERVER['HTTP_USER_AGENT'],
-                        'cracktrack' => $cracktrack,
-                        "Hacked" => $check);
-                    foreach ($arr as $key => $value) {
-                        $mail_msg .= $key . ":\t" . $value . PHP_EOL;
-                    }
-                    $header = 'From: ' . lykan_config::$config['email'] . "\r\n" . 'Reply-To: ' . lykan_config::$config['email'] . "\r\n" . 'X-Mailer: PHP/' . phpversion();
-                    mail(lykan_config::$config['email'], 'IP blocked: [SQLINJECTION] ' . self::get_host(), $mail_msg, $header, '-f' . lykan_config::$config['email']);
+            if (isset($json[$type . 'inject']) && is_array($json[$type . 'inject'])) {
+                foreach ((array )$json[$type . 'inject'] as $row) {
+                    $pattern[] = $row['i_term'];
                 }
-                self::exit_env('INJECT');
+
+                $check = str_ireplace($pattern, '*', $cracktrack);
+                if ($cracktrack != $check) {
+                    self::add_ip(self::get_the_ip());
+                    self::report_hack($itype);
+                    if (filter_var(lykan_config::$config['email'], FILTER_VALIDATE_EMAIL)) {
+                        $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]: ' . PHP_EOL;
+                        $arr = array(
+                            'IP' => self::get_the_ip(),
+                            'Host' => self::get_host(),
+                            'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . self::get_the_ip(),
+                            'HTTP_USER_AGENT' => $_SERVER['HTTP_USER_AGENT'],
+                            'cracktrack' => $cracktrack,
+                            "Hacked" => $check);
+                        foreach ($arr as $key => $value) {
+                            $mail_msg .= $key . ":\t" . $value . PHP_EOL;
+                        }
+                        $header = 'From: ' . lykan_config::$config['email'] . "\r\n" . 'Reply-To: ' . lykan_config::$config['email'] . "\r\n" . 'X-Mailer: PHP/' . phpversion();
+                        mail(lykan_config::$config['email'], 'IP blocked: [SQLINJECTION] ' . self::get_host(), $mail_msg, $header, '-f' . lykan_config::$config['email']);
+                    }
+                    self::exit_env('INJECT');
+                }
             }
         }
     }
@@ -793,26 +799,35 @@ class lykan {
     public static function get_current_pattern() {
         if (is_file(lykan_config::$config['lykan_blacklist']) && (integer)(time() - filemtime(lykan_config::$config['lykan_blacklist'])) > (lykan_config::$config['blacklist_lifetime_hours'] *
             3600)) {
-            @unlink(lykan_config::$config['lykan_blacklist']);
+            self::download_pattern();
         }
 
         if (!is_file(lykan_config::$config['lykan_blacklist'])) {
-            $data = array('cmd' => 'get_black_iplist');
-            lykan_client::call('DOWNLOAD', $data, lykan_config::$config['lykan_blacklist']);
+            file_put_contents(lykan_config::$config['lykan_blacklist'], json_encode(array()));
+            self::download_pattern();
         }
         if (file_exists(lykan_config::$config['lykan_blacklist'])) {
-            $json = file_get_contents(lykan_config::$config['lykan_blacklist']);
-            if (self::is_valid_json($json)) {
-                return $json;
+            $json_str = file_get_contents(lykan_config::$config['lykan_blacklist']);
+            if (self::is_valid_json($json_str)) {
+                return $json_str;
             }
             else {
-                @unlink(lykan_config::$config['lykan_blacklist']);
                 json_encode(array());
             }
         }
         else {
             json_encode(array());
         }
+    }
+
+    /**
+     * lykan::download_pattern()
+     * 
+     * @return void
+     */
+    protected static function download_pattern() {
+        $data = array('cmd' => 'get_black_iplist');
+        lykan_client::call('DOWNLOAD', $data, lykan_config::$config['lykan_blacklist']);
     }
 
     /**
