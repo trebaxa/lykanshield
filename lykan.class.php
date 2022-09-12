@@ -4,9 +4,9 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.6  
+ * @version   1.7  
  * @author    Harald Petrich <service@trebaxa.com>
- * @copyright 2018 - 2019 Harald Petrich
+ * @copyright 2018 - 2022 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
  * @note      This program is distributed in the hope that it will be useful - WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
@@ -267,14 +267,16 @@ class lykan {
         }
         if (self::is_filter_active('mime_types') === true) {
             $json = json_decode(self::get_current_pattern(), true);
-            $json['mime'] = (array )$json['mime'];
-            foreach ($json['mime'] as $mime => $ext) {
-                if ($file["type"] == $mime) {
-                    return;
+            if (isset($json['mime']) && count($json['mime']) > 0) {
+                $json['mime'] = (array )$json['mime'];
+                foreach ($json['mime'] as $mime => $ext) {
+                    if (strtolower($file["type"]) == strtolower($mime)) {
+                        return;
+                    }
                 }
+                self::report_hack(lykan_types::MIME_FILE_UPLOAD, $file["type"], false);
+                self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' ' . $file["type"]);
             }
-            self::report_hack(lykan_types::MIME_FILE_UPLOAD, $file["type"], false);
-            self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' ' . $file["type"]);
         }
     }
 
@@ -321,9 +323,9 @@ class lykan {
         self::load_config();
         if ($handle = opendir(lykan_config::$config['hpath'])) {
             while (false !== ($file = readdir($handle))) {
-                if ((integer)(time() - filemtime(lykan_config::$config['hpath'] . $file)) > (lykan_config::$config['hcache_lifetime_hours'] * 3600) && $file !== '.' && $file
-                    !== '..') {
-                    @unlink(lykan_config::$config['hpath'] . $file);
+                $fname = lykan_config::$config['hpath'] . $file;
+                if (is_file($fname) && $file !== '.' && $file !== '..' && (integer)(time() - filemtime($fname)) > (lykan_config::$config['hcache_lifetime_hours'] * 3600)) {
+                    @unlink($fname);
                 }
             }
         }
@@ -346,7 +348,7 @@ class lykan {
         self::block_bad_user_post();
         self::file_upload_protection();
         self::block_bad_bots();
-        self::block_bad_ips();
+        self::block_locale_bad_ips();
         self::worm_detect();
         self::sql_detect();
         self::clear_blocked();
@@ -532,14 +534,14 @@ class lykan {
     }
 
     /**
-     * lykan::block_bad_ips()
+     * lykan::block_locale_bad_ips()
      * locale stored bad ips
      * @return void
      */
-    protected static function block_bad_ips() {
+    protected static function block_locale_bad_ips() {
         if (self::is_filter_active('bad_ips') === true) {
-            $badips = self::get_bad_ips();
-            if (in_array(self::get_the_ip(), $badips)) {
+            $locale_badips = self::get_locale_bad_ips();
+            if (in_array(self::get_the_ip(), $locale_badips)) {
                 $fp = fopen(lykan_config::$config['lykan_blocked_file'], 'a+');
                 fwrite($fp, implode("\t", array(
                     date('Y-m-d H:i:s'),
@@ -567,11 +569,11 @@ class lykan {
     }
 
     /**
-     * lykan::get_bad_ips()
+     * lykan::get_locale_bad_ips()
      * 
      * @return
      */
-    protected static function get_bad_ips() {
+    protected static function get_locale_bad_ips() {
         if (is_file(lykan_config::$config['badips_file'])) {
             return explode(PHP_EOL, file_get_contents(lykan_config::$config['badips_file']));
         }
@@ -607,7 +609,7 @@ class lykan {
         self::set_root($path);
         self::auto_detect_system();
         return array(
-            'bad_ips' => (implode(PHP_EOL, self::get_bad_ips())),
+            'bad_ips' => (implode(PHP_EOL, self::get_locale_bad_ips())),
             'bad_bots' => (implode(PHP_EOL, self::read_bad_bots_from_cachefile())),
             );
     }
@@ -622,7 +624,7 @@ class lykan {
     public static function add_ip($ip) {
         $ip = trim($ip);
         if (self::is_valid_ip($ip)) {
-            $ip_list = self::get_bad_ips();
+            $ip_list = self::get_locale_bad_ips();
             $ip_list[] = trim($ip);
             $ip_list = array_unique($ip_list);
             file_put_contents(lykan_config::$config['badips_file'], implode(PHP_EOL, $ip_list));
@@ -636,7 +638,7 @@ class lykan {
      * @return void
      */
     public static function remove_ip($ip) {
-        $ip_list = self::get_bad_ips();
+        $ip_list = self::get_locale_bad_ips();
         $ip_list = array_diff($ip_list, array($ip));
         file_put_contents(lykan_config::$config['badips_file'], implode(PHP_EOL, $ip_list));
     }
@@ -799,10 +801,18 @@ class lykan {
             lykan_client::call('DOWNLOAD', $data, lykan_config::$config['lykan_blacklist']);
         }
         if (file_exists(lykan_config::$config['lykan_blacklist'])) {
-            return file_get_contents(lykan_config::$config['lykan_blacklist']);
+            $json = file_get_contents(lykan_config::$config['lykan_blacklist']);
+            if (self::is_valid_json($json)) {
+                return $json;
+            }
+            else {
+                @unlink(lykan_config::$config['lykan_blacklist']);
+                json_encode(array());
+            }
         }
-        else
+        else {
             json_encode(array());
+        }
     }
 
     /**
@@ -883,6 +893,7 @@ class lykan_types {
     CONST BAD_IP = 'BAD_IP';
     CONST STD = 'DEFAULT';
     CONST SQL_INJECT = 'SQL_INJECT';
+    CONST MIME_FILE_UPLOAD = 'MIME_FILE_UPLOAD';
     CONST DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
     CONST FILE_INJECT = 'FILE_INJECT';
     CONST XSS_INJECT = 'XSS_INJECT';
