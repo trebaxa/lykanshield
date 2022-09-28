@@ -4,7 +4,7 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.7  
+ * @version   1.8  
  * @author    Harald Petrich <service@trebaxa.com>
  * @copyright 2018 - 2022 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
@@ -29,9 +29,6 @@
  * 1. already implemented ;-)
  * 2. Take the better CMS -> www.keimeno.de
  */
-
-# define subpath of your project. last char must be a /
-define('SUB_PATH_OF_SYSTEM', '/');
 
 class lykan_config {
     public static $config = array(
@@ -88,12 +85,12 @@ class lykan {
         # detect Keimeno CMS
         if (is_dir(static::$lykan_root . 'admin') && is_file(static::$lykan_root . 'admin/inc/keimeno.class.php')) {
             self::set_config_arr(array(
-                'hpath' => static::$lykan_root . 'includes/lib/lykan/accesslog/',
-                'root' => static::$lykan_root . 'includes/lib/lykan/',
-                'lykan_blocked_file' => static::$lykan_root . 'includes/lib/lykan/hacklogblock_' . static::$host . '.txt',
-                'lykan_blacklist' => static::$lykan_root . 'includes/lib/lykan/blacklist.json',
-                'badips_file' => static::$lykan_root . 'includes/lib/lykan/badips_' . static::$host . '.txt',
-                'badbots_file' => static::$lykan_root . 'includes/lib/lykan/badbots_' . static::$host . '.txt',
+                'hpath' => static::$lykan_root . 'file_data/lykan/accesslog/',
+                'root' => static::$lykan_root . 'file_data/lykan/',
+                'lykan_blocked_file' => static::$lykan_root . 'file_data/lykan/hacklogblock_' . static::$host . '.txt',
+                'lykan_blacklist' => static::$lykan_root . 'file_data/lykan/blacklist.json',
+                'badips_file' => static::$lykan_root . 'file_data/lykan/badips_' . static::$host . '.txt',
+                'badbots_file' => static::$lykan_root . 'file_data/lykan/badbots_' . static::$host . '.txt',
                 ));
         }
 
@@ -222,11 +219,9 @@ class lykan {
      */
     protected static function set_root($path) {
         if (empty($path)) {
-            static::$lykan_root = $_SERVER['DOCUMENT_ROOT'] . (substr($_SERVER['DOCUMENT_ROOT'], -1) == DIRECTORY_SEPARATOR ? '' : DIRECTORY_SEPARATOR) . SUB_PATH_OF_SYSTEM;
+            $path = realpath($_SERVER['DOCUMENT_ROOT']);
         }
-        else {
-            static::$lykan_root = $path . (substr($path, -1) == DIRECTORY_SEPARATOR ? '' : DIRECTORY_SEPARATOR);
-        }
+        static::$lykan_root = $path . (substr($path, -1) == DIRECTORY_SEPARATOR ? '' : DIRECTORY_SEPARATOR);
     }
 
     /**
@@ -268,9 +263,9 @@ class lykan {
         if (self::is_filter_active('mime_types') === true) {
             $json = json_decode(self::get_current_pattern(), true);
             if (isset($json['mime']) && count($json['mime']) > 0) {
-                $json['mime'] = (array )$json['mime'];
-                foreach ($json['mime'] as $mime => $ext) {
-                    if (strtolower($file["type"]) == strtolower($mime)) {
+                $json['mime'] = (array )$json['mime'];                
+                foreach ($json['mime'] as $key => $mime) {
+                    if (strtolower($file["type"]) == strtolower($mime['m_mime'])) {
                         return;
                     }
                 }
@@ -285,7 +280,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function file_upload_protection() {
+    public static function file_upload_protection() {         
         if (isset($_FILES)) {
             foreach ($_FILES as $key => $row) {
                 #$ext = end((explode(".", $_FILES[$key]["name"])));
