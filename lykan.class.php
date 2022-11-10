@@ -4,7 +4,7 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.8  
+ * @version   1.7  
  * @author    Harald Petrich <service@trebaxa.com>
  * @copyright 2018 - 2022 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
@@ -33,7 +33,7 @@
 class lykan_config {
     public static $config = array(
         'apikey' => '', # from lykanshield.io, not needed for protection
-        'hcache_lifetime_hours' => 3, # cache lifetime of filters
+        'hcache_lifetime_hours' => 3, # cache lifetime in hours of filter files
         'blacklist_lifetime_hours' => 1, #locale blocked IPs life time
         'log_lines_count' => 98,
         'email' => '', #mail to send an info about sql injection attack
@@ -130,7 +130,7 @@ class lykan {
      * @return
      */
     public static function get_the_ip() {
-        return isset($_SERVER['HTTP_CLIENT_IP']) ? $_SERVER['HTTP_CLIENT_IP'] : isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : $_SERVER['REMOTE_ADDR'];
+        return (isset($_SERVER['HTTP_CLIENT_IP']) ? $_SERVER['HTTP_CLIENT_IP'] : isset($_SERVER['HTTP_X_FORWARDED_FOR'])) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : $_SERVER['REMOTE_ADDR'];
     }
 
     /**
@@ -263,7 +263,7 @@ class lykan {
         if (self::is_filter_active('mime_types') === true) {
             $json = json_decode(self::get_current_pattern(), true);
             if (isset($json['mime']) && count($json['mime']) > 0) {
-                $json['mime'] = (array )$json['mime'];                
+                $json['mime'] = (array )$json['mime'];
                 foreach ($json['mime'] as $key => $mime) {
                     if (strtolower($file["type"]) == strtolower($mime['m_mime'])) {
                         return;
@@ -280,7 +280,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function file_upload_protection() {         
+    public static function file_upload_protection() {
         if (isset($_FILES)) {
             foreach ($_FILES as $key => $row) {
                 #$ext = end((explode(".", $_FILES[$key]["name"])));
@@ -856,6 +856,14 @@ class lykan_client {
 
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) Gecko/20100101 Firefox/100.0');
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_FRESH_CONNECT, TRUE);
+        curl_setopt($curl, CURLOPT_URL, $url);
+        curl_setopt($curl, CURLOPT_HTTPHEADER, array(
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Cache-Control: no-cache, no-store, must-revalidate',
+            ));
         switch ($method) {
             case "POST":
                 curl_setopt($curl, CURLOPT_POST, 1);
@@ -875,11 +883,7 @@ class lykan_client {
                     $url = sprintf("%s?%s", $url, http_build_query(json_decode($data)));
                 break;
         }
-        curl_setopt($curl, CURLOPT_URL, $url);
-        curl_setopt($curl, CURLOPT_HTTPHEADER, array(
-            'Content-Type: application/json',
-            'Accept: application/json',
-            ));
+
 
         $result = curl_exec($curl);
         if (!$result) {
@@ -898,6 +902,7 @@ class lykan_client {
         return $result;
     }
 }
+
 
 class lykan_types {
     CONST BAD_IP = 'BAD_IP';
