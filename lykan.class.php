@@ -303,7 +303,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function init($path) {
+    public static function init($path = "") {
         self::set_root($path);
         self::auto_detect_system();
     }
@@ -530,6 +530,23 @@ class lykan {
         die('Bad agent [' . $reason . ']');
     }
 
+
+    /**
+     * lykan::create_ip_range()
+     * 
+     * @param mixed $ip
+     * @return
+     */
+    private static function create_ip_range(string $ip, int $star_count = 1) : string {
+        if (strpos($ip, ".") == true) {
+            return preg_replace('#(?:\.\d+){' . (int)$star_count . '}$#', str_repeat('.*', $star_count), $ip);
+        }
+        else {
+            # return preg_replace('~:[0-9a-z]+$~', ':*', $ip);
+            return preg_replace('#(?:\:[0-9a-z]+){{' . (int)$star_count . '}}$#', str_repeat(':*', $star_count), $ip);
+        }
+    }
+
     /**
      * lykan::block_locale_bad_ips()
      * locale stored bad ips
@@ -538,19 +555,42 @@ class lykan {
     protected static function block_locale_bad_ips() {
         if (self::is_filter_active('bad_ips') === true) {
             $locale_badips = self::get_locale_bad_ips();
-            if (in_array(self::get_the_ip(), $locale_badips)) {
-                $fp = fopen(lykan_config::$config['lykan_blocked_file'], 'a+');
-                fwrite($fp, implode("\t", array(
-                    date('Y-m-d H:i:s'),
-                    $_SERVER['HTTP_USER_AGENT'],
-                    'IP',
-                    self::get_the_ip())) . PHP_EOL);
-                fclose($fp);
-                self::report_hack(lykan_types::BAD_IP, self::get_the_ip(), false);
-                self::exit_env(lykan_types::BAD_IP);
+            foreach ($locale_badips as $ip) {
+                if (strstr($ip, '*')) {
+                    # IPv4 / IPv6 block range
+                    for ($i = 1; $i <= 3; $i++) {
+                        if (self::create_ip_range(self::get_the_ip(), $i) == $ip) {
+                            self::block_this_locale_bad_ip();
+                        }
+                    }
+                }
+                else {
+                    # block a specific ip
+                    if (self::get_the_ip() == $ip) {
+                        self::block_this_locale_bad_ip();
+                    }
+                }
             }
         }
     }
+
+    /**
+     * lykan::block_this_locale_bad_ip()
+     * 
+     * @return void
+     */
+    private static function block_this_locale_bad_ip() {
+        $fp = fopen(lykan_config::$config['lykan_blocked_file'], 'a+');
+        fwrite($fp, implode("\t", array(
+            date('Y-m-d H:i:s'),
+            $_SERVER['HTTP_USER_AGENT'],
+            'IP',
+            self::get_the_ip())) . PHP_EOL);
+        fclose($fp);
+        self::report_hack(lykan_types::BAD_IP, self::get_the_ip(), false);
+        self::exit_env(lykan_types::BAD_IP);
+    }
+
 
     /**
      * lykan::read_bad_bots_from_cachefile()
@@ -602,9 +642,8 @@ class lykan {
      * 
      * @return
      */
-    public function get_backend() {
-        self::set_root($path);
-        self::auto_detect_system();
+    public static function get_backend() {
+        self::init();
         return array(
             'bad_ips' => (implode(PHP_EOL, self::get_locale_bad_ips())),
             'bad_bots' => (implode(PHP_EOL, self::read_bad_bots_from_cachefile())),
@@ -619,13 +658,35 @@ class lykan {
      * @return void
      */
     public static function add_ip($ip) {
-        $ip = trim($ip);
-        if (self::is_valid_ip($ip)) {
+        $ip = trim(strtoupper($ip));
+        $ip = preg_replace("/[^A-Z0-9.:*]+/", "", $ip);
+        if (strstr($ip, '*') || self::is_valid_ip($ip)) {
             $ip_list = self::get_locale_bad_ips();
             $ip_list[] = trim($ip);
             $ip_list = array_unique($ip_list);
             file_put_contents(lykan_config::$config['badips_file'], implode(PHP_EOL, $ip_list));
         }
+    }
+
+    /**
+     * lykan::save()
+     * 
+     * @param mixed $ip_list
+     * @return void
+     */
+    public static function save(array $ip_list) {
+        self::init();
+        $ip_list = array_unique($ip_list);
+        $arr = [];
+        foreach ($ip_list as $ip) {
+            $ip = trim(strtoupper($ip));
+            $ip = preg_replace("/[^A-Z0-9.:*]+/", "", $ip);
+            if (strstr($ip, '*') || self::is_valid_ip($ip)) {
+                $arr[] = $ip;
+            }
+        }
+        $arr = array_unique($arr);
+        file_put_contents(lykan_config::$config['badips_file'], implode(PHP_EOL, $arr));
     }
 
     /**
