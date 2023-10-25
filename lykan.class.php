@@ -4,9 +4,9 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.7  
+ * @version   1.8  
  * @author    Harald Petrich <service@trebaxa.com>
- * @copyright 2018 - 2022 Harald Petrich
+ * @copyright 2018 - 2023 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
  * @note      This program is distributed in the hope that it will be useful - WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
@@ -230,9 +230,10 @@ class lykan {
      * @param mixed $name
      * @return void
      */
-    public static function check_filename($name) {
+    public static function check_filename(string $name) {
         if (self::is_filter_active('file_inject') === true) {
-            $ext = end((explode(".", $name)));
+            $arr = explode(".", $name);
+            $ext = end($arr);
             if (in_array($ext, lykan_config::$config['forbidden_file_ext']) || preg_match("/^.*\.([a-zA-Z]{3}).html$/", $name) || preg_match("/^.*\.([a-zA-Z]{3}).htm$/", $name)) {
                 self::report_hack(lykan_types::FILE_INJECT, $ext, false);
                 self::exit_env(lykan_types::FILE_INJECT . ' ' . $ext);
@@ -348,6 +349,7 @@ class lykan {
         self::sql_detect();
         self::clear_blocked();
         self::block_ips_and_bots_from_blacklist();
+        lykan_exploit::check_for_exploit();
         #self::check_agent();
 
         if (isset($_GET['lykan'])) {
@@ -384,10 +386,11 @@ class lykan {
         $json = json_decode(self::get_current_pattern(), true);
 
         # check bad IPs ( include IPs from stock DB and lykan network )
-        $json['badips'] = (array )$json['badips'];
-        if (isset($json['badips'][self::get_the_ip()])) {
-            self::report_hack(lykan_types::BAD_IP, "", false);
-            self::exit_env(lykan_types::BAD_IP . ' ' . $row['i_ip']);
+        if (isset($json['badips']) && is_array($json['badips'])) {
+            if (isset($json['badips'][self::get_the_ip()])) {
+                self::report_hack(lykan_types::BAD_IP, "", false);
+                self::exit_env(lykan_types::BAD_IP . ' ' . $row['i_ip']);
+            }
         }
 
         #check bots
@@ -525,7 +528,7 @@ class lykan {
      * 
      * @return void
      */
-    protected static function exit_env($reason = "") {
+    public static function exit_env($reason = "") {
         header('HTTP/1.0 403 Forbidden');
         die('Bad agent [' . $reason . ']');
     }
@@ -948,7 +951,7 @@ class lykan_client {
 
         $result = curl_exec($curl);
         if (!$result) {
-            die("Connection failure");
+            die("Lykan Connection failure");
         }
         curl_close($curl);
         if ($method == 'DOWNLOAD') {
@@ -964,11 +967,57 @@ class lykan_client {
     }
 }
 
+class lykan_exploit {
+
+    private static $queryString = "";
+
+    public static function check_for_exploit() {
+        if (isset($_SERVER['QUERY_STRING'])) {
+            static::$queryString = $_SERVER['QUERY_STRING'];
+        }
+        else {
+            static::$queryString = http_build_query(array_merge($_POST, $_GET));
+        }
+
+        if (!empty(static::$queryString)) {
+            if (self::contains_base64encode(static::$queryString) || self::contains_script_tag(static::$queryString) || self::contains_global_variable(static::$queryString) ||
+                self::contains_request_variable(static::$queryString) || self::contains_http_in_query(static::$queryString)) {
+                self::deny_access();
+            }
+        }
+    }
+
+    private static function contains_base64encode($query) {
+        return preg_match('/base64_encode\([^)]*\)/', $query);
+    }
+
+    private static function contains_script_tag($query) {
+        return preg_match('/<s*cript.*>|%3Cs*cript.*%3E/i', $query);
+    }
+
+    private static function contains_global_variable($query) {
+        return preg_match('/GLOBALS(=|\[|\%[0-9A-Z]{0,2})/', $query);
+    }
+
+    private static function contains_request_variable($query) {
+        return preg_match('/_REQUEST(=|\[|\%[0-9A-Z]{0,2})/', $query);
+    }
+
+    private static function contains_http_in_query($query) {
+        return strpos($query, 'http:') !== false || strpos($query, 'http:%') !== false;
+    }
+
+    private static function deny_access() {
+        lykan::report_hack(lykan_types::EXPLOIT, static::$queryString, false);
+        lykan::exit_env(lykan_types::EXPLOIT);
+    }
+}
 
 class lykan_types {
     CONST BAD_IP = 'BAD_IP';
     CONST STD = 'DEFAULT';
     CONST SQL_INJECT = 'SQL_INJECT';
+    CONST EXPLOIT = 'EXPLOIT';
     CONST MIME_FILE_UPLOAD = 'MIME_FILE_UPLOAD';
     CONST DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
     CONST FILE_INJECT = 'FILE_INJECT';
