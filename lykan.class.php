@@ -4,9 +4,9 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.8  
+ * @version   1.9  
  * @author    Harald Petrich <service@trebaxa.com>
- * @copyright 2018 - 2023 Harald Petrich
+ * @copyright 2018 - 2024 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
  * @note      This program is distributed in the hope that it will be useful - WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
@@ -284,15 +284,16 @@ class lykan {
     public static function file_upload_protection() {
         if (isset($_FILES)) {
             foreach ($_FILES as $key => $row) {
-                #$ext = end((explode(".", $_FILES[$key]["name"])));
-                if (!is_array($_FILES[$key]["name"])) {
+                if (!is_array($_FILES[$key]["name"]) && !empty($_FILES[$key]["name"])) {
                     self::check_filename($_FILES[$key]["name"]);
                     self::check_mime($row);
                 }
                 else {
                     foreach ($_FILES[$key]['name'] as $keya => $row2) {
-                        self::check_filename($_FILES[$key]["name"][$keya]);
-                        self::check_mime($row2);
+                        if (!empty($_FILES[$key]["name"][$keya])) {
+                            self::check_filename($_FILES[$key]["name"][$keya]);
+                            self::check_mime($row2);
+                        }
                     }
                 }
             }
