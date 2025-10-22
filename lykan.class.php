@@ -45,6 +45,7 @@ class lykan_config {
             'bad_ips' => true, # bad IP filter
             'sql_injection' => true, # SQL Injection filter
             'worm_injection' => true, # WORM Injection filter
+            'payloadlog' => false, # WORM Injection filter
             ),
         # forbidden file extentions on file upload
         'forbidden_file_ext' => array(
@@ -118,10 +119,45 @@ class lykan {
                 ));
         }
 
-        if (!is_dir(lykan_config::$config['root']))
-            mkdir(lykan_config::$config['root'], 0755);
+
         if (!is_dir(lykan_config::$config['hpath']))
             mkdir(lykan_config::$config['hpath'], 0755);
+
+        $dir = rtrim(self::get_root(), DIRECTORY_SEPARATOR);
+        if (!is_dir($dir) || !is_file($dir . DIRECTORY_SEPARATOR . 'index.html')) {
+            // create directory
+            @mkdir($dir, 0750, true);
+
+            // try to set strict permissions (best-effort)
+            @chmod($dir, 0750);
+
+            // create a simple index.html so directory listings show nothing (fallback)
+            $index_file = $dir . DIRECTORY_SEPARATOR . 'index.html';
+            if (!is_file($index_file)) {
+                @file_put_contents($index_file, '<!doctype html><meta charset="utf-8"><title>Forbidden</title>');
+                @chmod($index_file, 0640);
+            }
+
+            // create an Apache .htaccess that denies access (best for Apache setups)
+            $htaccess = $dir . DIRECTORY_SEPARATOR . '.htaccess';
+            if (!is_file($htaccess)) {
+                // For modern Apache: "Require all denied" is preferred, but include both for compatibility
+                $ht_content = "Order deny,allow\nDeny from all\n<IfModule mod_authz_core.c>\n  Require all denied\n</IfModule>\n";
+                @file_put_contents($htaccess, $ht_content);
+                @chmod($htaccess, 0640);
+            }
+
+            // create an empty .user.ini (optional) to prevent php settings exposure (shared hosts)
+            $userini = $dir . DIRECTORY_SEPARATOR . '.user.ini';
+            if (!is_file($userini)) {
+                @file_put_contents($userini, "display_errors = Off\n");
+                @chmod($userini, 0640);
+            }
+        }
+        else {
+            // try to tighten permissions on existing dir (best-effort)
+            @chmod($dir, 0750);
+        }
     }
 
     /**
@@ -351,6 +387,7 @@ class lykan {
         self::clear_blocked();
         self::block_ips_and_bots_from_blacklist();
         lykan_exploit::check_for_exploit();
+        self::payloadlog();
         #self::check_agent();
 
         if (isset($_GET['lykan'])) {
@@ -359,6 +396,17 @@ class lykan {
             self::echo_table($result['hour_log'], $result['hour_log_count'] . ' Clients (last hour)');
             self::echo_table($result['blocked_bots'], 'Bad Bot blocked list');
             die();
+        }
+    }
+
+    /**
+     * lykan::payloadlog()
+     * 
+     * @return
+     */
+    protected static function payloadlog() {
+        if (self::is_filter_active('payloadlog') === true) {
+            payload_logger::log_request(lykan_config::$config['hpath']);
         }
     }
 
@@ -530,8 +578,8 @@ class lykan {
      * @return void
      */
     public static function exit_env($reason = "") {
-        header('HTTP/1.0 403 Forbidden');
-        die('Bad agent [' . $reason . ']');
+        #   header('HTTP/1.0 403 Forbidden');
+        #   die('Bad agent [' . $reason . ']');
     }
 
 
@@ -733,7 +781,7 @@ class lykan {
      * @return void
      */
     private static function worm_detect() {
-        self::detect_injection('worm', lykan_types::WORM_INJECT);
+        self::detect_worm_injection('worm', lykan_types::WORM_INJECT);
         $check = $cracktrack = self::get_query_string();
         $json = json_decode(self::get_current_pattern(), true);
         if (isset($json['xssinject']) && is_array($json['xssinject'])) {
@@ -748,54 +796,424 @@ class lykan {
     }
 
     /**
+     * write_sql_inject_log
+     *
+     * Writes a detailed, capped log entry for SQL injection detections.
+     * Accepts the detection array ($d) and the prepared $log_line.
+     */
+    private static function write_sql_inject_log(array $d, string $log_line) {
+        try {
+            $log_file = static::$lykan_root . 'lykan/accesslog/sql_inject.log';
+            $log_dir = dirname($log_file);
+            if (!is_dir($log_dir)) {
+                @mkdir($log_dir, 0755, true);
+            }
+
+            $max_entries = 10000;
+            $lines = @file($log_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if (!is_array($lines)) {
+                $lines = array();
+            }
+
+            $ip = self::get_the_ip();
+            $host = self::get_host();
+            $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+            $url = (isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : (isset($_SERVER['PHP_SELF']) ? $_SERVER['PHP_SELF'] : '')) . (isset($_SERVER['QUERY_STRING']) &&
+                $_SERVER['QUERY_STRING'] !== '' ? ('?' . $_SERVER['QUERY_STRING']) : '');
+
+            $extra = '';
+            if (isset($d['pattern']))
+                $extra .= ' pattern=' . $d['pattern'];
+            if (isset($d['matched_variant']))
+                $extra .= ' matched=' . $d['matched_variant'];
+            if (isset($d['value_snippet']))
+                $extra .= ' snippet=' . $d['value_snippet'];
+
+            // sanitize newlines and clamp lengths
+            $safe_extra = preg_replace('/[\r\n\t]+/', ' ', $extra);
+            $safe_ua = preg_replace('/[\r\n\t]+/', ' ', substr($ua, 0, 512));
+            $safe_url = preg_replace('/[\r\n\t]+/', ' ', substr($url, 0, 1024));
+
+            $entry = date('c') . ' - IP=' . $ip . ' - Host=' . $host . ' - ' . $log_line . ' -' . $safe_extra . ' - UA=' . $safe_ua . ' - URL=' . $safe_url;
+
+            $lines[] = $entry;
+
+            // keep only most recent $max_entries entries
+            if (count($lines) > $max_entries) {
+                $lines = array_slice($lines, -$max_entries);
+            }
+
+            @file_put_contents($log_file, implode(PHP_EOL, $lines) . PHP_EOL, LOCK_EX);
+            @chmod($log_file, 0640);
+        }
+        catch (\Throwable $t) {
+            // ignore logging failures so detection still blocks
+        }
+    }
+
+    /**
      * lykan::sql_detect()
      * 
      * @return void
      */
     private static function sql_detect() {
-        self::detect_injection('sql', lykan_types::SQL_INJECT);
+        // If the simpler pattern-based SQL injection filter flags a problem, exit
+        # self::detect_injection('sql', lykan_types::SQL_INJECT);
+
+        if (self::is_filter_active('sql_injection') !== true) {
+            return;
+        }
+
+        $patterns = array();
+
+        // load JSON patterns (tolerant)
+        $json_raw = self::get_current_pattern();
+        $json = json_decode($json_raw, true);
+        if (is_array($json)) {
+            foreach ($json as $section_key => $section) {
+                if (!is_array($section))
+                    continue;
+                if ($section_key === 'sqlinject') {
+                    foreach ($section as $row) {
+                        if (isset($row['i_term'])) {
+                            $term = (string )$row['i_term'];
+                            $term = trim($term);
+                            if ($term !== '') {
+                                $patterns[] = $term;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // deduplicate patterns and normalize to lower case for case-insensitive matching
+        $patterns = array_values(array_unique(array_map('trim', $patterns)));
+        $lc_patterns = array();
+        foreach ($patterns as $p) {
+            $lc_patterns[] = mb_strtolower($p, 'UTF-8');
+        }
+
+        // collect inputs (uses your existing helper)
+        $inputs = self::collect_inputs_for_sqli_check();
+
+        $detections = array();
+
+        foreach ($inputs as $val) {
+            // safety: ensure string and not empty
+            if (!is_string($val) && !is_numeric($val))
+                continue;
+            $s = (string )$val;
+            $s_trim = trim($s);
+            if ($s_trim === '')
+                continue;
+
+
+            // prepare variants to detect encoded payloads
+            $variants = array();
+            $variants[] = $s_trim;
+            // rawurldecode handles %xx sequences; do both rawurldecode and urldecode
+            $rawurld = @rawurldecode($s_trim);
+            if ($rawurld !== false && $rawurld !== $s_trim)
+                $variants[] = $rawurld;
+            $urld = @urldecode($s_trim);
+            if ($urld !== false && $urld !== $s_trim)
+                $variants[] = $urld;
+            // double decode (attackers sometimes double-encode)
+            $double = @rawurldecode(@rawurldecode($s_trim));
+            if ($double !== false && $double !== $s_trim && $double !== $rawurld && $double !== $urld) {
+                $variants[] = $double;
+            }
+
+            // also lowercased variants for case-insensitive substring search
+            $lc_variants = array();
+            foreach ($variants as $v) {
+                $lc_variants[] = mb_strtolower($v, 'UTF-8');
+            }
+
+            // 2) pattern matching (plain substring, case-insensitive)
+            foreach ($lc_patterns as $idx => $pattern) {
+                if ($pattern === '')
+                    continue;
+                foreach ($lc_variants as $v) {
+                    if ($v === '')
+                        continue;
+                    if (mb_strpos($v, $pattern, 0, 'UTF-8') !== false) {
+                        $detections[] = array(
+                            'type' => 'pattern',
+                            'pattern' => $patterns[$idx], // original pattern
+                            'matched_variant' => substr($v, 0, 200),
+                            'value_snippet' => substr($s_trim, 0, 120));
+                        // once matched for this pattern against this input, skip to next pattern
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        // optional: log detections (only short snippet, no full value)
+        if (!empty($detections)) {
+            foreach ($detections as $d) {
+                $log_line = date('c') . " - sql_detect: type=" . $d['type'];
+                if (isset($d['reason']))
+                    $log_line .= " reason=" . $d['reason'];
+                if (isset($d['pattern']))
+                    $log_line .= " pattern=" . $d['pattern'];
+                $log_line .= " snippet=" . (isset($d['value_snippet']) ? $d['value_snippet'] : 'n/a');
+
+                // write the detection to a dedicated SQL injection log file
+                // delegate logging to helper (writes capped log and extra meta)
+                self::write_sql_inject_log($d, $log_line);
+
+                // record the offending IP in the local bad IP list
+                self::add_ip(self::get_the_ip());
+                // report the hack to the central service
+                self::report_hack(lykan_types::SQL_INJECT);
+                if (filter_var(lykan_config::$config['email'], FILTER_VALIDATE_EMAIL)) {
+                    $mail_msg = 'Hacking blocked [SQL_INJECTION]: ' . PHP_EOL;
+                    $arr = array(
+                        'IP' => self::get_the_ip(),
+                        'Host' => self::get_host(),
+                        'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . self::get_the_ip(),
+                        'HTTP_USER_AGENT' => $_SERVER['HTTP_USER_AGENT'],
+                        'cracktrack' => $log_line,
+                        );
+                    foreach ($arr as $key => $value) {
+                        $mail_msg .= $key . ":\t" . $value . PHP_EOL;
+                    }
+                    $header = 'From: ' . lykan_config::$config['email'] . "\r\n" . 'Reply-To: ' . lykan_config::$config['email'] . "\r\n" . 'X-Mailer: PHP/' . phpversion();
+                    mail(lykan_config::$config['email'], 'IP blocked: [SQLINJECTION] ' . self::get_host(), $mail_msg, $header, '-f' . lykan_config::$config['email']);
+                }
+                self::exit_env('INJECT');
+            }
+        }
+
+        // return array of detections (empty = no detection)
+        # return $detections;
     }
 
 
     /**
-     * lykan::detect_injection()
+     * Collect all candidate input strings to run SQLi heuristics on.
+     * - collects $_GET, $_POST (recursive), JSON body for application/json
+     * - skips sensitive keys (password, token, secret, auth, etc.)
+     * - normalizes and limits lengths
+     *
+     * Returns array of strings (non-empty, utf8, trimmed).
+     */
+    private static function collect_inputs_for_sqli_check() : array {
+        $result = array();
+
+        // Keys to skip (sensitive)
+        $skip_keys_regex = '/pass(word)?$|pwd$|token$|secret$|auth($|orization)/i';
+
+        // Helper: recursive walk
+        $walk = function ($data, $prefix = '')use (&$walk, &$result, $skip_keys_regex) {
+            if (is_array($data)) {
+                foreach ($data as $k => $v) {
+                    // if key looks sensitive - skip entire subtree/value
+                    if (is_string($k) && preg_match($skip_keys_regex, $k)) {
+                        continue;
+                    }
+                    $walk($v, $prefix === '' ? (string )$k : ($prefix . '.' . $k));
+                }
+                return;
+            }
+
+            // Only check scalar types
+            if (is_scalar($data)) {
+                $s = (string )$data;
+                $s = trim($s);
+                if ($s === '')
+                    return;
+
+                // limit length (protect from huge payloads)
+                $max_len = 2048;
+                if (strlen($s) > $max_len) {
+                    $s = substr($s, 0, $max_len);
+                }
+
+                // ensure UTF-8 (json_encode later requires UTF-8)
+                if (!mb_check_encoding($s, 'UTF-8')) {
+                    $s = mb_convert_encoding($s, 'UTF-8', 'auto');
+                }
+
+                $result[] = $s;
+            }
+        }
+        ;
+
+        // GET and POST (recursive)
+        $walk($_GET);
+        $walk($_POST);
+
+
+        // Also add decoded query-string forms and URL-decoded variants to catch encoded payloads
+        if (isset($_SERVER['QUERY_STRING']) && $_SERVER['QUERY_STRING'] !== '') {
+            // parse_str decodes percent-encoding
+            $qs = $_SERVER['QUERY_STRING'];
+            parse_str($qs, $qs_arr);
+            $walk($qs_arr);
+            // also test raw and raw urldecoded once (shortened)
+            $rawq = rawurldecode($qs);
+            if ($rawq !== '') {
+                $result[] = substr($rawq, 0, 2048);
+            }
+        }
+
+        // optionally include cookies (be careful, cookies may contain session tokens)
+        // $walk($_COOKIE);
+
+        // remove duplicates, keep order
+        $seen = array();
+        $out = array();
+        foreach ($result as $v) {
+            if ($v === '')
+                continue;
+            if (isset($seen[$v]))
+                continue;
+            $seen[$v] = true;
+            $out[] = $v;
+        }
+
+        return $out;
+    }
+
+
+    /**
+     * lykan::detect_worm_injection()
      * 
      * @param mixed $type
      * @param mixed $itype
      * @return void
      */
-    public static function detect_injection($type, $itype) {
-        if (self::is_filter_active($type . '_injection') === true) {
-            $cracktrack = self::get_query_string();
-            $json = json_decode(self::get_current_pattern(), true);
-            if (isset($json[$type . 'inject']) && is_array($json[$type . 'inject'])) {
-                foreach ((array )$json[$type . 'inject'] as $row) {
-                    $pattern[] = $row['i_term'];
-                }
+    public static function detect_worm_injection($type, $itype) {
+        // quick guard: is detection active?
+        if (!self::is_filter_active($type . '_injection')) {
+            return false;
+        }
 
-                $check = str_ireplace($pattern, '*', $cracktrack);
-                if ($cracktrack != $check) {
-                    self::add_ip(self::get_the_ip());
-                    self::report_hack($itype);
-                    if (filter_var(lykan_config::$config['email'], FILTER_VALIDATE_EMAIL)) {
-                        $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]: ' . PHP_EOL;
-                        $arr = array(
-                            'IP' => self::get_the_ip(),
-                            'Host' => self::get_host(),
-                            'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . self::get_the_ip(),
-                            'HTTP_USER_AGENT' => $_SERVER['HTTP_USER_AGENT'],
-                            'cracktrack' => $cracktrack,
-                            "Hacked" => $check);
-                        foreach ($arr as $key => $value) {
-                            $mail_msg .= $key . ":\t" . $value . PHP_EOL;
-                        }
-                        $header = 'From: ' . lykan_config::$config['email'] . "\r\n" . 'Reply-To: ' . lykan_config::$config['email'] . "\r\n" . 'X-Mailer: PHP/' . phpversion();
-                        mail(lykan_config::$config['email'], 'IP blocked: [SQLINJECTION] ' . self::get_host(), $mail_msg, $header, '-f' . lykan_config::$config['email']);
-                    }
-                    self::exit_env('INJECT');
+        // get raw query string (original behaviour)
+        $cracktrack = self::get_query_string();
+        if (!is_string($cracktrack) || $cracktrack === '') {
+            return false;
+        }
+
+        // load JSON patterns once, tolerant parsing
+        $json_raw = self::get_current_pattern();
+        $json = @json_decode($json_raw, true);
+        if (!is_array($json)) {
+            return false;
+        }
+
+        // collect patterns from any section named like "$typeinject" or fallback to any i_term
+        $patterns = array();
+        $needle_key = $type . 'inject';
+        foreach ($json as $section_key => $section) {
+            if (!is_array($section))
+                continue;
+            // if JSON has the specific key, prefer it
+            if ($section_key === $needle_key) {
+                foreach ($section as $row) {
+                    if (isset($row['i_term']))
+                        $patterns[] = (string )$row['i_term'];
+                }
+                break;
+            }
+        }
+        // if none found under specific key, collect all i_term entries in the JSON
+        if (empty($patterns)) {
+            foreach ($json as $section) {
+                if (!is_array($section))
+                    continue;
+                foreach ($section as $row) {
+                    if (isset($row['i_term']))
+                        $patterns[] = (string )$row['i_term'];
                 }
             }
         }
+
+        if (empty($patterns)) {
+            return false;
+        }
+
+        // normalize patterns (trim, lowercase) and dedupe
+        $lc_patterns = array();
+        foreach ($patterns as $p) {
+            $p = trim($p);
+            if ($p === '')
+                continue;
+            $lc_patterns[mb_strtolower($p, 'UTF-8')] = $p; // keep original as value for reporting
+        }
+        if (empty($lc_patterns))
+            return false;
+
+        // variants to check: raw and rawurldecode (to catch url-encoded payloads)
+        $variants = array($cracktrack);
+        $decoded = @rawurldecode($cracktrack);
+        if ($decoded !== false && $decoded !== $cracktrack) {
+            $variants[] = $decoded;
+        }
+
+        // lowercased variants for case-insensitive search
+        $lc_variants = array();
+        foreach ($variants as $v) {
+            $lc_variants[] = mb_strtolower($v, 'UTF-8');
+        }
+
+        // iterate patterns and variants and stop on first match (fast path)
+        $matched_pattern = null;
+        $matched_variant_snippet = null;
+        foreach ($lc_patterns as $lc_pat => $orig_pat) {
+            foreach ($lc_variants as $variant) {
+                if ($variant === '')
+                    continue;
+                if (mb_strpos($variant, $lc_pat, 0, 'UTF-8') !== false) {
+                    $matched_pattern = $orig_pat;
+                    $matched_variant_snippet = mb_substr($variant, 0, 300, 'UTF-8');
+                    break 2;
+                }
+            }
+        }
+
+        if ($matched_pattern === null) {
+            // no pattern match found; nothing to do
+            return false;
+        }
+
+        // pattern matched: take action (log, block, notify)
+        $ip = self::get_the_ip();
+        self::add_ip($ip);
+        self::report_hack($itype);
+
+        // prepare limited mail / log content (NO full payloads)
+        $snippet = substr($matched_variant_snippet, 0, 300);
+        $safe_snip = preg_replace('/[\r\n\t]+/', ' ', $snippet);
+
+        // only send mail if configured
+        $to = isset(lykan_config::$config['email']) ? lykan_config::$config['email'] : null;
+        if ($to && filter_var($to, FILTER_VALIDATE_EMAIL)) {
+            $mail_msg = 'Hacking blocked [' . strtoupper($type) . '_INJECTION]' . PHP_EOL . PHP_EOL;
+            $info = array(
+                'IP' => $ip,
+                'Host' => self::get_host(),
+                'Trace' => 'https://www.ip-tracker.org/locator/ip-lookup.php?ip=' . $ip,
+                'HTTP_USER_AGENT' => isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '',
+                'DetectedPattern' => $matched_pattern,
+                'MatchedSnippet' => $safe_snip,
+                );
+            foreach ($info as $k => $v) {
+                $mail_msg .= $k . ":\t" . $v . PHP_EOL;
+            }
+            $headers = 'From: ' . $to . "\r\n" . 'Reply-To: ' . $to . "\r\n" . 'X-Mailer: PHP/' . phpversion();
+            @mail($to, 'IP blocked: [SQLINJECTION] ' . self::get_host(), $mail_msg, $headers, '-f' . $to);
+        }
+
+        // final action: exit environment (preserves existing behaviour)
+        self::exit_env('INJECT');
+
+        // detection handled
+        return true;
     }
 
 
@@ -816,6 +1234,7 @@ class lykan {
      * @return void
      */
     public static function report_hack($h_type, $h_type_info = "", $adddb = true) {
+        #return;
         $arr = array(
             'cmd' => 'report_hack',
             'adddb' => $adddb,
@@ -857,28 +1276,100 @@ class lykan {
      * @return void
      */
     public static function get_current_pattern() {
-        if (is_file(lykan_config::$config['lykan_blacklist']) && (integer)(time() - filemtime(lykan_config::$config['lykan_blacklist'])) > (lykan_config::$config['blacklist_lifetime_hours'] *
-            3600)) {
-            self::download_pattern();
-        }
+        $path = lykan_config::$config['lykan_blacklist'];
+        $lifetime_hours = isset(lykan_config::$config['blacklist_lifetime_hours']) ? (int)lykan_config::$config['blacklist_lifetime_hours'] : 0;
+        $lock_ttl = isset(lykan_config::$config['download_lock_ttl_seconds']) ? (int)lykan_config::$config['download_lock_ttl_seconds'] : 300; // 5 minutes
+        $lock_path = $path . '.lock';
 
-        if (!is_file(lykan_config::$config['lykan_blacklist'])) {
-            file_put_contents(lykan_config::$config['lykan_blacklist'], json_encode(array()));
-            self::download_pattern();
-        }
-        if (file_exists(lykan_config::$config['lykan_blacklist'])) {
-            $json_str = file_get_contents(lykan_config::$config['lykan_blacklist']);
-            if (self::is_valid_json($json_str)) {
-                return $json_str;
-            }
-            else {
-                json_encode(array());
+        $need_download = false;
+
+
+        // 1) Decide if refresh is needed
+        if (is_file($path)) {
+            $age = time() - @filemtime($path);
+            if ($age > ($lifetime_hours * 3600)) {
+                $need_download = true;
             }
         }
         else {
-            json_encode(array());
+            // Missing file -> need initial download
+            $need_download = true;
         }
+
+        // 2) Empty or invalid JSON -> refresh
+        if (is_file($path)) {
+            if (@filesize($path) === 0) {
+                $need_download = true;
+            }
+            else {
+                $json_str = @file_get_contents($path);
+                if ($json_str === false || !self::is_valid_json($json_str)) {
+                    $need_download = true;
+                }
+                else {
+                    $data = json_decode($json_str, true);
+                    // Refresh empty array/object
+                    if ((is_array($data) && count($data) === 0) || (is_object($data) && count((array )$data) === 0)) {
+                        $need_download = true;
+                    }
+                }
+            }
+        }
+
+        // 3) Respect lock: if another process is downloading, skip download attempt
+        if ($need_download) {
+            $locked = false;
+
+            // lock exists and is fresh -> do not download now (avoid recursion / endless loops)
+            if (is_file($lock_path)) {
+                $lock_age = time() - @filemtime($lock_path);
+                if ($lock_age < $lock_ttl) {
+                    $locked = true;
+                }
+                else {
+                    // stale lock -> remove it
+                    @unlink($lock_path);
+                }
+            }
+
+            if (!$locked) {
+                // Try to acquire lock atomically
+                // Note: file_put_contents with LOCK_EX is not an inter-process mutex by itself,
+                // but creating a new lock file is usually atomic on POSIX filesystems.
+                $lock_created = @file_put_contents($lock_path, (string )time(), LOCK_EX) !== false;
+
+                if ($lock_created) {
+                    try {
+                        // Optional: write a small placeholder to indicate refresh intent (not required)
+                        // @file_put_contents($path, json_encode(array('status' => 'updating')));
+
+                        self::download_pattern(); // must overwrite $path on success
+                    }
+                    catch (\Throwable $e) {
+                        // swallow; we'll fall through to reading whatever exists
+                    }
+                    finally {
+                        // Always remove lock to prevent deadlocks
+                        @unlink($lock_path);
+                    }
+                }
+            }
+        }
+
+        // 4) Return the best available JSON
+        if (is_file($path)) {
+            $json_str = @file_get_contents($path);
+            if ($json_str !== false && self::is_valid_json($json_str)) {
+                return $json_str;
+            }
+        }
+
+        // 5) Fallback to empty JSON array (and write it once)
+        $empty = json_encode(array());
+        @file_put_contents($path, $empty);
+        return $empty;
     }
+
 
     /**
      * lykan::download_pattern()
@@ -918,10 +1409,9 @@ class lykan_client {
         $data['host'] = lykan::get_host();
         $data['hash'] = hash('sha512', implode(':', [$data['apikey'], $data['host'], lykan::get_timestamp()]));
         $data = json_encode($data);
-
         $curl = curl_init();
         curl_setopt($curl, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) Gecko/20100101 Firefox/100.0');
-        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 30);
         curl_setopt($curl, CURLOPT_FRESH_CONNECT, TRUE);
         curl_setopt($curl, CURLOPT_URL, $url);
         curl_setopt($curl, CURLOPT_HTTPHEADER, array(
@@ -1037,4 +1527,373 @@ class lykan_types {
     CONST MAIL_HACKING = 'MAIL_HACKING';
     CONST ADMINLOGIN = 'ADMINLOGIN';
     CONST BAD_LOCAL_IP = 'BAD_LOCAL_IP';
+}
+
+/**
+ * payload_logger
+ *
+ * Static logger that writes a TSV (tab-separated) log line for every page request to:
+ *   CMS_ROOT . 'file_data/lykan/pageload.xls'
+ *
+ * - Uses fputcsv with "\t" delimiter (Excel opens it directly)
+ * - Creates directory + .htaccess / web.config protection
+ * - Restrictive chmod and simple file rotation
+ * - Collects maximum request and client info (IP, headers, payload, etc.)
+ *
+ * Conventions:
+ * - Function names snake_case
+ * - Arrays use array()
+ * - Comments in English
+ */
+
+class payload_logger {
+    private static $rel_path = 'pageload.xls';
+    private static $dir_mode = 0750;
+    private static $file_mode = 0640;
+    private static $max_bytes = 10 * 1024 * 1024; // rotate at 10MB
+
+    /**
+     * Call this once per request to log the event
+     */
+    /**
+     * log_request()
+     * 
+     * @param mixed $root
+     * @return
+     */
+    public static function log_request($root) {
+        try {
+            $full_dir = dirname($root . self::$rel_path);
+            self::ensure_dir_and_protect($full_dir);
+
+            $file = $root . self::$rel_path;
+
+            // Rotate if needed
+            if (is_file($file) && filesize($file) > self::$max_bytes) {
+                self::rotate_file($file);
+
+                // --- Enforce max 10 .bak files (delete oldest) ---
+                // Works for both "<file>.bak" and "<file>.bak.*" naming schemes
+                $bak_files = array();
+                $glob_a = glob($file . '.bak');
+                $glob_b = glob($file . '.bak.*');
+
+                if (is_array($glob_a)) {
+                    $bak_files = array_merge($bak_files, $glob_a);
+                }
+                if (is_array($glob_b)) {
+                    $bak_files = array_merge($bak_files, $glob_b);
+                }
+
+                if (is_array($bak_files) && count($bak_files) > 10) {
+                    // Sort by modification time (oldest first)
+                    usort($bak_files, function ($a, $b) {
+                        $ma = @filemtime($a); $mb = @filemtime($b); if ($ma === false && $mb === false)return 0; if ($ma === false)return - 1; if ($mb === false)return 1; return ($ma <
+                            $mb) ? -1 : (($ma > $mb) ? 1 : 0); }
+                    );
+
+                    // Delete oldest so that only 10 remain
+                    $to_delete = array_slice($bak_files, 0, count($bak_files) - 10);
+                    foreach ($to_delete as $old_file) {
+                        @unlink($old_file)
+                            ;
+                    }
+                }
+                // --- End backup cap enforcement ---
+            }
+
+            $is_new = !is_file($file);
+            $fp = @fopen($file, 'a');
+            if ($fp === false) {
+                return false;
+            }
+
+            if ($is_new) {
+                @chmod($file, self::$file_mode);
+            }
+
+            $record = self::build_record();
+
+            // Header line for new file
+            if ($is_new) {
+                $header = array(
+                    'iso_ts',
+                    'ts',
+                    'remote_ip',
+                    'forwarded_for',
+                    'remote_port',
+                    'host',
+                    'request_method',
+                    'request_uri',
+                    'query_string',
+                    'script_name',
+                    'php_sapi',
+                    'server_name',
+                    'server_addr',
+                    'user_agent',
+                    'referer',
+                    'accept_language',
+                    'cookies',
+                    'get',
+                    'post',
+                    'raw_body',
+                    'headers',
+                    'env',
+                    'reverse_dns',
+                    'process_id',
+                    'session_id');
+                @flock($fp, LOCK_EX);
+                fputcsv($fp, $header, "\t", '"');
+                @flock($fp, LOCK_UN);
+            }
+
+            @flock($fp, LOCK_EX);
+            fputcsv($fp, $record, "\t", '"');
+            @flock($fp, LOCK_UN);
+            fclose($fp);
+
+            return true;
+        }
+        catch (Exception $e) {
+            return false;
+        }
+    }
+
+
+    /**
+     * Build a TSV record with maximum client + request context
+     */
+    /**
+     * build_record()
+     * 
+     * @return
+     */
+    private static function build_record() {
+        $now = time();
+        $iso = date('c', $now);
+
+        $remote_ip = self::get_the_ip();
+        $forwarded_for = isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : '';
+        $remote_port = isset($_SERVER['REMOTE_PORT']) ? $_SERVER['REMOTE_PORT'] : '';
+        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : '');
+        $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : '-';
+        $request_uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '-';
+        $query_string = isset($_SERVER['QUERY_STRING']) ? $_SERVER['QUERY_STRING'] : '';
+        $script_name = isset($_SERVER['SCRIPT_NAME']) ? $_SERVER['SCRIPT_NAME'] : '';
+        $php_sapi = php_sapi_name();
+        $server_name = isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : '';
+        $server_addr = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : '';
+        $user_agent = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
+        $referer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : '';
+        $accept_language = isset($_SERVER['HTTP_ACCEPT_LANGUAGE']) ? $_SERVER['HTTP_ACCEPT_LANGUAGE'] : '';
+        $cookies = isset($_COOKIE) ? $_COOKIE : array();
+        $get = isset($_GET) ? $_GET : array();
+        $post = isset($_POST) ? $_POST : array();
+        $raw_body = @file_get_contents('php://input');
+        $headers = self::get_request_headers();
+
+        $env = array(
+            'REMOTE_ADDR' => isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '',
+            'SERVER_PROTOCOL' => isset($_SERVER['SERVER_PROTOCOL']) ? $_SERVER['SERVER_PROTOCOL'] : '',
+            'HTTPS' => (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 1 : 0,
+            'HTTP_X_REQUESTED_WITH' => isset($_SERVER['HTTP_X_REQUESTED_WITH']) ? $_SERVER['HTTP_X_REQUESTED_WITH'] : '',
+            );
+
+        $reverse_dns = @gethostbyaddr($remote_ip);
+        $process_id = getmypid();
+        $session_id = (session_status() == PHP_SESSION_ACTIVE && isset($_SESSION) && session_id() != '') ? session_id() : '';
+
+        // --- Helper: remove any keys that contain "password" or "passwort" (case-insensitive) ---
+        $sanitize_sensitive = null; // declare first so we can reference by use(&...)
+        $sanitize_sensitive = function ($arr)use (&$sanitize_sensitive) {
+            if (!is_array($arr)) {
+                return $arr;
+            }
+            $clean = array();
+            foreach ($arr as $key => $value) {
+                // Cast key to string for regex safety (numeric keys won't match anyway)
+                $key_str = (string )$key;
+
+                // Skip any key that looks like a password field
+                if (preg_match('/pass(?:word|wort)/i', $key_str)) {
+                    continue;
+                }
+
+                // Recurse into nested arrays
+                if (is_array($value)) {
+                    $clean[$key] = $sanitize_sensitive($value);
+                }
+                else {
+                    $clean[$key] = $value;
+                }
+            }
+            return $clean;
+        }
+        ;
+
+        // Sanitize arrays before JSON encoding
+        $cookies = $sanitize_sensitive($cookies);
+        $get = $sanitize_sensitive($get);
+        $post = $sanitize_sensitive($post);
+        $headers = $sanitize_sensitive($headers);
+
+        $json_cookies = self::json_safe($cookies);
+        $json_get = self::json_safe($get);
+        $json_post = self::json_safe($post);
+        $json_headers = self::json_safe($headers);
+        $json_env = self::json_safe($env);
+
+        return array(
+            $iso,
+            $now,
+            $remote_ip,
+            $forwarded_for,
+            $remote_port,
+            $host,
+            $method,
+            $request_uri,
+            $query_string,
+            $script_name,
+            $php_sapi,
+            $server_name,
+            $server_addr,
+            $user_agent,
+            $referer,
+            $accept_language,
+            $json_cookies,
+            $json_get,
+            $json_post,
+            (string )$raw_body,
+            $json_headers,
+            $json_env,
+            $reverse_dns,
+            $process_id,
+            $session_id);
+    }
+
+
+    /**
+     * ensure_dir_and_protect()
+     * 
+     * @param mixed $dir
+     * @return void
+     */
+    private static function ensure_dir_and_protect($dir) {
+        if (!is_dir($dir)) {
+            @mkdir($dir, self::$dir_mode, true);
+            @chmod($dir, self::$dir_mode);
+        }
+
+        // .htaccess
+        $htaccess = $dir . DIRECTORY_SEPARATOR . '.htaccess';
+        if (!is_file($htaccess)) {
+            $content = implode("\n", array(
+                "# Prevent web access to this directory",
+                "<IfModule mod_authz_core.c>",
+                "    Require all denied",
+                "</IfModule>",
+                "<IfModule !mod_authz_core.c>",
+                "    Order allow,deny",
+                "    Deny from all",
+                "</IfModule>"));
+            @file_put_contents($htaccess, $content);
+            @chmod($htaccess, 0640);
+        }
+
+        // IIS: web.config
+        $webconfig = $dir . DIRECTORY_SEPARATOR . 'web.config';
+        if (!is_file($webconfig)) {
+            $wcontent = '<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <system.webServer>
+    <security>
+      <authorization>
+        <remove users="?" roles="" verbs=""/>
+        <add accessType="Deny" users="*" />
+      </authorization>
+    </security>
+  </system.webServer>
+</configuration>';
+            @file_put_contents($webconfig, $wcontent);
+            @chmod($webconfig, 0640);
+        }
+
+        // index.html for safety
+        $index = $dir . DIRECTORY_SEPARATOR . 'index.html';
+        if (!is_file($index)) {
+            @file_put_contents($index, '<!doctype html><html><head><meta charset="utf-8"><title>Forbidden</title></head><body>Forbidden.</body></html>');
+            @chmod($index, 0644);
+        }
+    }
+
+    /**
+     * rotate_file()
+     * 
+     * @param mixed $file
+     * @return void
+     */
+    private static function rotate_file($file) {
+        $bak = $file . '.' . date('Ymd_His') . '.bak';
+        @rename($file, $bak);
+    }
+
+    /**
+     * get_the_ip()
+     * 
+     * @return
+     */
+    private static function get_the_ip() {
+        $keys = array(
+            'HTTP_CLIENT_IP',
+            'HTTP_X_FORWARDED_FOR',
+            'HTTP_X_REAL_IP',
+            'REMOTE_ADDR');
+        foreach ($keys as $k) {
+            if (!empty($_SERVER[$k])) {
+                $ip = $_SERVER[$k];
+                if (strpos($ip, ',') !== false) {
+                    $parts = explode(',', $ip);
+                    $ip = trim($parts[0]);
+                }
+                if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                    return $ip;
+                }
+            }
+        }
+        return '0.0.0.0';
+    }
+
+    /**
+     * get_request_headers()
+     * 
+     * @return
+     */
+    private static function get_request_headers() {
+        if (function_exists('getallheaders')) {
+            $h = @getallheaders();
+            return is_array($h) ? $h : array();
+        }
+        $headers = array();
+        foreach ($_SERVER as $name => $value) {
+            if (substr($name, 0, 5) == 'HTTP_') {
+                $key = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($name, 5)))));
+                $headers[$key] = $value;
+            }
+        }
+        return $headers;
+    }
+
+    /**
+     * json_safe()
+     * 
+     * @param mixed $data
+     * @return
+     */
+    private static function json_safe($data) {
+        $j = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($j === false) {
+            return base64_encode(serialize($data));
+        }
+        return $j;
+    }
 }
