@@ -1397,6 +1397,34 @@ class lykan_client {
     protected static $endpoint = 'https://www.lykanshield.io/rest/';
 
     /**
+     * append_error_log()
+     * Keeps only the last 30 error lines inside the Lykan data/download directory.
+     */
+    protected static function append_error_log($message) {
+        $root = rtrim(lykan_config::$config['root'], DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        $path = $root . 'lykan_error.log';
+
+        $entry = date('c') . "\t" . $message;
+        $lines = array();
+
+        if (is_file($path)) {
+            $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if (!is_array($lines)) {
+                $lines = array();
+            }
+        }
+
+        $lines[] = $entry;
+
+        // keep only the newest 30 entries
+        if (count($lines) > 30) {
+            $lines = array_slice($lines, -30);
+        }
+
+        @file_put_contents($path, implode(PHP_EOL, $lines) . PHP_EOL, LOCK_EX);
+    }
+
+    /**
      * call()
      * 
      * @param mixed $method
@@ -1430,6 +1458,12 @@ class lykan_client {
                 curl_setopt($curl, CURLOPT_POST, 1);
                 curl_setopt($curl, CURLOPT_POSTFIELDS, $data);
                 $fp = fopen($local_file, 'w');
+                if ($fp === false) {
+                    curl_close($curl);
+                    error_log('Lykan connection failure: unable to write to ' . $local_file);
+                    self::append_error_log('Lykan connection failure: unable to write to ' . $local_file);
+                    return false;
+                }
                 curl_setopt($curl, CURLOPT_FILE, $fp);
                 break;
             default:
@@ -1441,19 +1475,46 @@ class lykan_client {
 
 
         $result = curl_exec($curl);
-        if (!$result) {
-            die("Lykan Connection failure");
-        }
+        $curl_error = curl_error($curl);
+        $http_code = (int)curl_getinfo($curl, CURLINFO_HTTP_CODE);
+
         curl_close($curl);
-        if ($method == 'DOWNLOAD') {
+        if (isset($fp) && is_resource($fp)) {
             fclose($fp);
+        }
+
+        // treat network errors or HTTP 4xx/5xx as failure, but do not stop execution
+        $is_failure = ($result === false) || ($http_code >= 400);
+        if ($is_failure) {
+            // cleanup incomplete downloads
+            if ($method === 'DOWNLOAD' && !empty($local_file) && is_file($local_file)) {
+                @unlink($local_file);
+            }
+            $log_msg = 'Lykan connection failure';
+            if (!empty($curl_error)) {
+                $log_msg .= ': ' . $curl_error;
+            }
+            elseif ($http_code >= 400) {
+                $log_msg .= ': HTTP ' . $http_code;
+            }
+            error_log($log_msg);
+            self::append_error_log($log_msg);
+            return false;
+        }
+
+        if ($method == 'DOWNLOAD') {
+            if (!is_file($local_file)) {
+                return false;
+            }
             if (filesize($local_file) < 10000) {
                 if (strstr(file_get_contents($local_file), '302 Found')) {
                     @unlink($local_file);
                     return false;
                 }
             }
+            return true;
         }
+
         return $result;
     }
 }
