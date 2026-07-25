@@ -4,9 +4,9 @@
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   1.9  
+ * @version   2.0  
  * @author    Harald Petrich <service@trebaxa.com>
- * @copyright 2018 - 2024 Harald Petrich
+ * @copyright 2018 - 2026 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
  * @note      This program is distributed in the hope that it will be useful - WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
