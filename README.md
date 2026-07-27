@@ -22,7 +22,7 @@ regular application updates.
 
 ## Requirements
 
-- PHP 7.3 or newer with the cURL, JSON and Fileinfo extensions
+- PHP 8.2 or newer with the cURL, JSON and Fileinfo extensions
 - the optional mbstring extension for full Unicode-aware signature matching
 - permission for the PHP process to create and write the LykanShield data
   directory

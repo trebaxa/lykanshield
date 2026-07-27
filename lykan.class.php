@@ -1,10 +1,13 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
  * @version   2.0  
+ * @requires  PHP 8.2 or newer
  * @author    Harald Petrich <service@trebaxa.com>
  * @copyright 2018 - 2026 Harald Petrich
  * @license   GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999
@@ -31,7 +34,7 @@
  */
 
 class lykan_config {
-    public static $config = array(
+    public static array $config = array(
         'apikey' => '', # from lykanshield.io, not needed for protection
         'hcache_lifetime_hours' => 3, # cache lifetime in hours of filter files
         'blacklist_lifetime_hours' => 1, #locale blocked IPs life time
@@ -81,19 +84,19 @@ class lykan_config {
 
 class lykan {
 
-    protected static $lykan_root = "";
-    protected static $host = "";
-    private static $report_flush_scheduled = false;
-    private static $blacklist_raw_cache = null;
-    private static $blacklist_data_cache = null;
-    private static $blacklist_cache_path = "";
-    private static $blacklist_shard_manifest_cache = null;
-    private static $blacklist_ip_shard_cache = array();
-    private static $rules_unavailable_reported = false;
-    private static $initialized = false;
-    private static $config_loaded = false;
-    private static $rule_refresh_scheduled = false;
-    private static $response_finished = false;
+    protected static string $lykan_root = '';
+    protected static string $host = '';
+    private static bool $report_flush_scheduled = false;
+    private static ?string $blacklist_raw_cache = null;
+    private static ?array $blacklist_data_cache = null;
+    private static string $blacklist_cache_path = '';
+    private static ?array $blacklist_shard_manifest_cache = null;
+    private static array $blacklist_ip_shard_cache = array();
+    private static bool $rules_unavailable_reported = false;
+    private static bool $initialized = false;
+    private static bool $config_loaded = false;
+    private static bool $rule_refresh_scheduled = false;
+    private static bool $response_finished = false;
 
     /**
      * lykan::auto_detect_system()
@@ -213,7 +216,7 @@ class lykan {
      * 
      * @return string
      */
-    public static function get_the_ip() {
+    public static function get_the_ip(): string {
         $remote_addr = isset($_SERVER['REMOTE_ADDR']) ? trim((string)$_SERVER['REMOTE_ADDR']) : '';
         if (!filter_var($remote_addr, FILTER_VALIDATE_IP)) {
             return '0.0.0.0';
@@ -544,7 +547,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function load_config() {
+    public static function load_config(): array {
         if (!self::$initialized) {
             self::init();
         }
@@ -572,7 +575,7 @@ class lykan {
      * @param mixed $arr
      * @return void
      */
-    public static function save_config(array $arr) {
+    public static function save_config(array $arr): bool {
         self::ensure_initialized();
         $json = json_encode($arr, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         if ($json === false) {
@@ -587,7 +590,7 @@ class lykan {
      * 
      * @return string
      */
-    public static function get_root() {
+    public static function get_root(): string {
         if (!self::$initialized) {
             self::init();
         }
@@ -613,7 +616,7 @@ class lykan {
      * @param mixed $name
      * @return void
      */
-    public static function check_filename(string $name) {
+    public static function check_filename(string $name): void {
         self::ensure_initialized();
         if (self::is_filter_active('file_inject') === true) {
             $normalized_name = str_replace('\\', '/', trim($name));
@@ -730,7 +733,7 @@ class lykan {
      *
      * @return void
      */
-    public static function file_upload_protection() {
+    public static function file_upload_protection(): void {
         self::ensure_initialized();
         $uploads = isset($_FILES) && is_array($_FILES) ? $_FILES : array();
         foreach ($uploads as $upload) {
@@ -757,7 +760,7 @@ class lykan {
      * @param array $upload One top-level entry from the $_FILES superglobal.
      * @return array
      */
-    private static function normalize_uploaded_files(array $upload) {
+    private static function normalize_uploaded_files(array $upload): array {
         if (!array_key_exists('name', $upload)) {
             return array();
         }
@@ -826,7 +829,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function init($path = "") {
+    public static function init(string $path = ''): void {
         self::set_root($path);
         self::$initialized = true;
         self::$config_loaded = false;
@@ -839,7 +842,7 @@ class lykan {
      * @param string $path Optional application root.
      * @return void
      */
-    private static function ensure_initialized($path = "") {
+    private static function ensure_initialized(string $path = ''): void {
         if (!self::$initialized || $path !== '') {
             self::init($path);
         }
@@ -853,7 +856,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function run($path = "") {
+    public static function run(string $path = ''): void {
         self::ensure_initialized($path);
         self::maybe_cleanup_request_cache();
 
@@ -1076,7 +1079,7 @@ class lykan {
      * 
      * @return string
      */
-    public static function get_user_agent() {
+    public static function get_user_agent(): string {
         return isset($_SERVER['HTTP_USER_AGENT']) ? substr($_SERVER['HTTP_USER_AGENT'], 0, 254) : '';
     }
 
@@ -1086,7 +1089,7 @@ class lykan {
      * @param mixed $k
      * @return void
      */
-    public static function read_logs() {
+    public static function read_logs(): array {
         self::ensure_initialized();
         $result = array(
             'hour_log' => array(),
@@ -1161,7 +1164,7 @@ class lykan {
      * 
      * @return void
      */
-    public static function exit_env($reason = "") {
+    public static function exit_env(string $reason = ''): never {
         if (!headers_sent()) {
             http_response_code(403);
             header('Content-Type: text/plain; charset=UTF-8');
@@ -1341,7 +1344,7 @@ class lykan {
      * 
      * @return array
      */
-    public static function get_backend() {
+    public static function get_backend(): array {
         self::ensure_initialized();
         return array(
             'bad_ips' => (implode(PHP_EOL, self::get_locale_bad_ips())),
@@ -1356,7 +1359,7 @@ class lykan {
      * @param mixed $ip
      * @return void
      */
-    public static function add_ip($ip) {
+    public static function add_ip(string $ip): void {
         self::ensure_initialized();
         $ip = self::normalize_blocked_ip_entry($ip);
         if ($ip !== '') {
@@ -1374,7 +1377,7 @@ class lykan {
      * @param mixed $ip_list
      * @return void
      */
-    public static function save(array $ip_list) {
+    public static function save(array $ip_list): bool {
         self::ensure_initialized();
         $ip_list = array_unique($ip_list);
         $arr = [];
@@ -1396,7 +1399,7 @@ class lykan {
      * @param mixed $ip
      * @return void
      */
-    public static function remove_ip($ip) {
+    public static function remove_ip(string $ip): bool {
         self::ensure_initialized();
         $ip = self::normalize_blocked_ip_entry($ip);
         if ($ip === '') {
@@ -1494,7 +1497,7 @@ class lykan {
      * @param mixed $ip
      * @return bool
      */
-    public static function is_valid_ip($ip) {
+    public static function is_valid_ip(string $ip): bool {
         if (!filter_var($ip, FILTER_VALIDATE_IP) && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
             return false;
         }
@@ -1888,7 +1891,7 @@ class lykan {
      * @param mixed $itype
      * @return void
      */
-    public static function detect_worm_injection($type, $itype) {
+    public static function detect_worm_injection(string $type, string $itype): bool {
         self::ensure_initialized();
         // quick guard: is detection active?
         if (!self::is_filter_active($type . '_injection')) {
@@ -2023,7 +2026,7 @@ class lykan {
      * 
      * @return string
      */
-    public static function get_host() {
+    public static function get_host(): string {
         $raw_host = isset($_SERVER['HTTP_HOST'])
             ? (string)$_SERVER['HTTP_HOST']
             : (isset($_SERVER['SERVER_NAME']) ? (string)$_SERVER['SERVER_NAME'] : '');
@@ -2070,7 +2073,7 @@ class lykan {
      * @param bool $adddb Whether the central service should persist the report.
      * @return bool
      */
-    public static function report_hack($h_type, $h_type_info = "", $adddb = true) {
+    public static function report_hack(string $h_type, string $h_type_info = '', bool $adddb = true): bool {
         self::ensure_initialized();
         $type_info = preg_replace('/[\r\n\t\0]+/', ' ', (string)$h_type_info);
         $event = array(
@@ -2117,7 +2120,7 @@ class lykan {
      * @param int $limit Maximum number of reports to send.
      * @return int Number of successfully delivered reports.
      */
-    public static function flush_report_queue($limit = 20) {
+    public static function flush_report_queue(int $limit = 20): int {
         self::ensure_initialized();
         $limit = max(1, min(100, (int)$limit));
         $queue_path = self::get_report_queue_path();
@@ -2208,7 +2211,7 @@ class lykan {
      * @param integer $limit
      * @return array|null
      */
-    public static function get_lock($days, $limit = 0) {
+    public static function get_lock(int $days, int $limit = 0): ?array {
         self::ensure_initialized();
         $domain = self::get_host();
         $days = (int)$days;
@@ -2219,7 +2222,11 @@ class lykan {
             'domain' => $domain,
             'khash' => hash('sha256', $domain . $days . lykan::get_timestamp()));
         $str = lykan_client::call('POST', $arr);
-        return json_decode($str, true);
+        if (!is_string($str)) {
+            return null;
+        }
+        $decoded = json_decode($str, true);
+        return is_array($decoded) ? $decoded : null;
     }
 
     /**
@@ -2227,7 +2234,7 @@ class lykan {
      *
      * @return string Current blacklist JSON or an empty JSON object.
      */
-    public static function get_current_pattern() {
+    public static function get_current_pattern(): string {
         self::ensure_initialized();
         $path = lykan_config::$config['lykan_blacklist'];
         $lifetime_hours = isset(lykan_config::$config['blacklist_lifetime_hours']) ? (int)lykan_config::$config['blacklist_lifetime_hours'] : 0;
@@ -2310,7 +2317,7 @@ class lykan {
      * @param string $path Optional application root.
      * @return bool True when new rules were installed.
      */
-    public static function refresh_rules($path = "") {
+    public static function refresh_rules(string $path = ''): bool {
         self::ensure_initialized($path);
         $target = lykan_config::$config['lykan_blacklist'];
         $lock_path = $target . '.lock';
@@ -2368,7 +2375,7 @@ class lykan {
      *
      * @return array
      */
-    private static function get_current_pattern_data() {
+    private static function get_current_pattern_data(): array {
         self::get_current_pattern();
         $rules = is_array(self::$blacklist_data_cache) ? self::$blacklist_data_cache : array();
         if (count($rules) === 0 && self::should_block_when_rules_unavailable('blacklist and detection rules')) {
@@ -2994,7 +3001,7 @@ class lykan {
      * 
      * @return string
      */
-    public static function get_timestamp() {
+    public static function get_timestamp(): string {
         $now = new DateTime("now", new DateTimeZone('CET'));
         return date('YmdHi', strtotime($now->format('Y-m-d H:i:s')) - $now->format('Z'));
     }
@@ -3002,7 +3009,7 @@ class lykan {
 
 class lykan_client {
 
-    protected static $endpoint = 'https://www.lykanshield.io/rest/';
+    protected static string $endpoint = 'https://www.lykanshield.io/rest/';
 
     /**
      * append_error_log()
@@ -3048,7 +3055,7 @@ class lykan_client {
      * @param string $local_file Download destination for DOWNLOAD requests.
      * @return string|bool Response body, download status or false on failure.
      */
-    public static function call($method, array $data, $local_file = "") {
+    public static function call(string $method, array $data, string $local_file = ''): string|bool {
         $method = strtoupper(trim((string)$method));
         if (!in_array($method, array('GET', 'POST', 'DOWNLOAD'), true)) {
             self::append_error_log('Unsupported Lykan HTTP method: ' . $method);
@@ -3215,14 +3222,14 @@ class lykan_client {
 
 class lykan_exploit {
 
-    private static $queryString = "";
+    private static string $queryString = '';
 
     /**
      * Inspect the current query string for common exploit signatures.
      *
      * @return void
      */
-    public static function check_for_exploit() {
+    public static function check_for_exploit(): void {
         if (isset($_SERVER['QUERY_STRING'])) {
             static::$queryString = $_SERVER['QUERY_STRING'];
         }
@@ -3244,8 +3251,8 @@ class lykan_exploit {
      * @param string $query Query string to inspect.
      * @return bool
      */
-    private static function contains_base64encode($query) {
-        return preg_match('/base64_encode\([^)]*\)/', $query);
+    private static function contains_base64encode(string $query): bool {
+        return preg_match('/base64_encode\([^)]*\)/', $query) === 1;
     }
 
     /**
@@ -3254,8 +3261,8 @@ class lykan_exploit {
      * @param string $query Query string to inspect.
      * @return bool
      */
-    private static function contains_script_tag($query) {
-        return preg_match('/<\s*script\b[^>]*>|%3C(?:%20)*script\b.*?%3E/i', $query);
+    private static function contains_script_tag(string $query): bool {
+        return preg_match('/<\s*script\b[^>]*>|%3C(?:%20)*script\b.*?%3E/i', $query) === 1;
     }
 
     /**
@@ -3264,8 +3271,8 @@ class lykan_exploit {
      * @param string $query Query string to inspect.
      * @return bool
      */
-    private static function contains_global_variable($query) {
-        return preg_match('/GLOBALS(=|\[|\%[0-9A-Z]{0,2})/', $query);
+    private static function contains_global_variable(string $query): bool {
+        return preg_match('/GLOBALS(=|\[|\%[0-9A-Z]{0,2})/', $query) === 1;
     }
 
     /**
@@ -3274,8 +3281,8 @@ class lykan_exploit {
      * @param string $query Query string to inspect.
      * @return bool
      */
-    private static function contains_request_variable($query) {
-        return preg_match('/_REQUEST(=|\[|\%[0-9A-Z]{0,2})/', $query);
+    private static function contains_request_variable(string $query): bool {
+        return preg_match('/_REQUEST(=|\[|\%[0-9A-Z]{0,2})/', $query) === 1;
     }
 
     /**
@@ -3283,35 +3290,35 @@ class lykan_exploit {
      *
      * @return void
      */
-    private static function deny_access() {
+    private static function deny_access(): never {
         lykan::report_hack(lykan_types::EXPLOIT, static::$queryString, false);
         lykan::exit_env(lykan_types::EXPLOIT);
     }
 }
 
 class lykan_types {
-    CONST BAD_IP = 'BAD_IP';
-    CONST STD = 'DEFAULT';
-    CONST SQL_INJECT = 'SQL_INJECT';
-    CONST EXPLOIT = 'EXPLOIT';
-    CONST MIME_FILE_UPLOAD = 'MIME_FILE_UPLOAD';
-    CONST DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
-    CONST FILE_INJECT = 'FILE_INJECT';
-    CONST XSS_INJECT = 'XSS_INJECT';
-    CONST BAD_USER_POST = 'BAD_USER_POST';
-    CONST BLACK_LIST_BOT = 'BLACK_LIST_BOT';
-    CONST INVALID_USER_AGENT = 'INVALID_USER_AGENT';
-    CONST WORM_INJECT = 'WORM_INJECT';
-    CONST HTTP_INJECTION = 'HTTP_INJECTION';
-    CONST CONTACTFORM_HIDDENMAILFIELD = 'CONTACTFORM_HIDDENMAILFIELD';
-    CONST B8 = 'B8';
-    CONST REDIRECT_PARAM = 'REDIRECT_PARAM';
-    CONST INVALIDHASH = 'INVALIDHASH';
-    CONST SECUREDOWNLOAD = 'SECUREDOWNLOAD';
-    CONST CMD_WITH_NO_PERMISSIONS = 'CMD_WITH_NO_PERMISSIONS';
-    CONST MAIL_HACKING = 'MAIL_HACKING';
-    CONST ADMINLOGIN = 'ADMINLOGIN';
-    CONST BAD_LOCAL_IP = 'BAD_LOCAL_IP';
+    public const BAD_IP = 'BAD_IP';
+    public const STD = 'DEFAULT';
+    public const SQL_INJECT = 'SQL_INJECT';
+    public const EXPLOIT = 'EXPLOIT';
+    public const MIME_FILE_UPLOAD = 'MIME_FILE_UPLOAD';
+    public const DOUBLEUSE_ACCOUNT = 'DOUBLEUSE_ACCOUNT';
+    public const FILE_INJECT = 'FILE_INJECT';
+    public const XSS_INJECT = 'XSS_INJECT';
+    public const BAD_USER_POST = 'BAD_USER_POST';
+    public const BLACK_LIST_BOT = 'BLACK_LIST_BOT';
+    public const INVALID_USER_AGENT = 'INVALID_USER_AGENT';
+    public const WORM_INJECT = 'WORM_INJECT';
+    public const HTTP_INJECTION = 'HTTP_INJECTION';
+    public const CONTACTFORM_HIDDENMAILFIELD = 'CONTACTFORM_HIDDENMAILFIELD';
+    public const B8 = 'B8';
+    public const REDIRECT_PARAM = 'REDIRECT_PARAM';
+    public const INVALIDHASH = 'INVALIDHASH';
+    public const SECUREDOWNLOAD = 'SECUREDOWNLOAD';
+    public const CMD_WITH_NO_PERMISSIONS = 'CMD_WITH_NO_PERMISSIONS';
+    public const MAIL_HACKING = 'MAIL_HACKING';
+    public const ADMINLOGIN = 'ADMINLOGIN';
+    public const BAD_LOCAL_IP = 'BAD_LOCAL_IP';
 }
 
 /**
@@ -3332,11 +3339,11 @@ class lykan_types {
  */
 
 class payload_logger {
-    private static $rel_path = 'pageload.xls';
-    private static $dir_mode = 0750;
-    private static $file_mode = 0640;
-    private static $max_bytes = 10 * 1024 * 1024; // rotate at 10MB
-    private static $max_age_seconds = 3600; // delete the active log after one hour
+    private static string $rel_path = 'pageload.xls';
+    private static int $dir_mode = 0750;
+    private static int $file_mode = 0640;
+    private static int $max_bytes = 10 * 1024 * 1024; // rotate at 10MB
+    private static int $max_age_seconds = 3600; // delete the active log after one hour
 
     /**
      * log_request()
@@ -3344,7 +3351,7 @@ class payload_logger {
      * @param mixed $root
      * @return bool
      */
-    public static function log_request($root) {
+    public static function log_request(string $root): bool {
         try {
             $full_dir = dirname($root . self::$rel_path);
             if (!self::ensure_dir_and_protect($full_dir)) {
