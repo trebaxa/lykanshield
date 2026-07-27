@@ -42,8 +42,17 @@ class lykan_config {
         'client_timeout_seconds' => 30,
         'client_max_download_bytes' => 10 * 1024 * 1024,
         'blacklist_max_entries_per_section' => 50000,
+        'remote_regex_max_pattern_bytes' => 512,
+        'request_inspection_max_bytes' => 8192,
+        'rules_unavailable_action' => 'monitor', # monitor or block
         'sql_injection_block_score' => 3,
         'report_queue_max_entries' => 1000,
+        'local_bad_ip_max_entries' => 5000,
+        'local_bad_ip_lifetime_hours' => 720,
+        'request_cache_bucket_count' => 1024,
+        'request_cache_cleanup_probability' => 100,
+        'runtime_artifact_lifetime_hours' => 24,
+        'refresh_rules_after_response' => true,
         'bad_user_post_action' => 'log', # log or block; blocking requires explicit opt-in
         'filter_active' => array(
             'mime_types' => true, #activates mime filter
@@ -53,6 +62,7 @@ class lykan_config {
             'bad_ips' => true, # bad IP filter
             'sql_injection' => true, # SQL Injection filter
             'worm_injection' => true, # WORM Injection filter
+            'exploit' => true, # common query-string exploit signatures
             'payloadlog' => false, # WORM Injection filter
             ),
         # forbidden file extentions on file upload
@@ -74,6 +84,16 @@ class lykan {
     protected static $lykan_root = "";
     protected static $host = "";
     private static $report_flush_scheduled = false;
+    private static $blacklist_raw_cache = null;
+    private static $blacklist_data_cache = null;
+    private static $blacklist_cache_path = "";
+    private static $blacklist_shard_manifest_cache = null;
+    private static $blacklist_ip_shard_cache = array();
+    private static $rules_unavailable_reported = false;
+    private static $initialized = false;
+    private static $config_loaded = false;
+    private static $rule_refresh_scheduled = false;
+    private static $response_finished = false;
 
     /**
      * lykan::auto_detect_system()
@@ -329,6 +349,52 @@ class lykan {
     }
 
     /**
+     * Write a recurring runtime error at most once per configured interval.
+     * State is shared between PHP workers and capped to known recent keys.
+     *
+     * @param string $key Stable, non-user-controlled error identifier.
+     * @param string $message Error message.
+     * @param int $interval Minimum interval in seconds.
+     * @return void
+     */
+    private static function log_runtime_error_rate_limited($key, $message, $interval = 3600) {
+        if (!isset(lykan_config::$config['root'])) {
+            self::log_runtime_error($message);
+            return;
+        }
+
+        $path = rtrim(self::get_root(), '/\\') . DIRECTORY_SEPARATOR . 'error_rate_limits.json';
+        $now = time();
+        $interval = max(60, (int)$interval);
+        $should_log = false;
+        $updated = self::update_locked_file($path, function ($current) use ($key, $now, $interval, &$should_log) {
+            $state = json_decode((string)$current, true);
+            $state = is_array($state) ? $state : array();
+            foreach ($state as $state_key => $timestamp) {
+                if (!is_numeric($timestamp) || ($now - (int)$timestamp) > ($interval * 2)) {
+                    unset($state[$state_key]);
+                }
+            }
+            $key = substr(preg_replace('/[^a-z0-9_.-]+/i', '-', (string)$key), 0, 80);
+            $last = isset($state[$key]) ? (int)$state[$key] : 0;
+            if (($now - $last) >= $interval) {
+                $state[$key] = $now;
+                $should_log = true;
+            }
+            if (count($state) > 100) {
+                asort($state, SORT_NUMERIC);
+                $state = array_slice($state, -100, null, true);
+            }
+            $json = json_encode($state, JSON_UNESCAPED_SLASHES);
+            return is_string($json) ? $json : '{}';
+        });
+
+        if (!$updated || $should_log) {
+            self::log_runtime_error($message);
+        }
+    }
+
+    /**
      * Replace a file while holding an exclusive lock.
      *
      * @param string $path Destination file path.
@@ -479,14 +545,24 @@ class lykan {
      * @return void
      */
     public static function load_config() {
+        if (!self::$initialized) {
+            self::init();
+        }
         $conf_file = self::get_root() . 'config.json';
         if (is_file($conf_file)) {
             $json = self::read_locked_file($conf_file);
             if (is_string($json) && self::is_valid_json($json)) {
                 $arr = json_decode($json, true);
+                if (isset($arr['filter_active']) && is_array($arr['filter_active'])) {
+                    $arr['filter_active'] = array_merge(
+                        lykan_config::$config['filter_active'],
+                        $arr['filter_active']
+                    );
+                }
                 lykan_config::$config = array_merge(lykan_config::$config, $arr);
             }
         }
+        self::$config_loaded = true;
         return lykan_config::$config;
     }
 
@@ -497,6 +573,7 @@ class lykan {
      * @return void
      */
     public static function save_config(array $arr) {
+        self::ensure_initialized();
         $json = json_encode($arr, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         if ($json === false) {
             self::log_runtime_error('Unable to encode configuration as JSON.');
@@ -511,6 +588,9 @@ class lykan {
      * @return string
      */
     public static function get_root() {
+        if (!self::$initialized) {
+            self::init();
+        }
         return lykan_config::$config['root'];
     }
 
@@ -534,6 +614,7 @@ class lykan {
      * @return void
      */
     public static function check_filename(string $name) {
+        self::ensure_initialized();
         if (self::is_filter_active('file_inject') === true) {
             $normalized_name = str_replace('\\', '/', trim($name));
             $normalized_name = rtrim(basename($normalized_name), ". \t\n\r\0\x0B");
@@ -612,7 +693,7 @@ class lykan {
             self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' unknown MIME type');
         }
 
-        $json = json_decode(self::get_current_pattern(), true);
+        $json = self::get_current_pattern_data();
         $allowed_mimes = array();
         if (isset($json['mime']) && is_array($json['mime'])) {
             foreach ($json['mime'] as $mime) {
@@ -626,8 +707,10 @@ class lykan {
         }
 
         if (count($allowed_mimes) === 0) {
-            self::log_runtime_error('MIME allowlist is empty; upload was rejected.');
-            self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' empty MIME allowlist');
+            if (self::should_block_when_rules_unavailable('MIME allowlist')) {
+                self::exit_env(lykan_types::MIME_FILE_UPLOAD . ' empty MIME allowlist');
+            }
+            return;
         }
 
         if (in_array($detected_mime, array_unique($allowed_mimes), true)) {
@@ -648,6 +731,7 @@ class lykan {
      * @return void
      */
     public static function file_upload_protection() {
+        self::ensure_initialized();
         $uploads = isset($_FILES) && is_array($_FILES) ? $_FILES : array();
         foreach ($uploads as $upload) {
             if (!is_array($upload)) {
@@ -744,7 +828,24 @@ class lykan {
      */
     public static function init($path = "") {
         self::set_root($path);
+        self::$initialized = true;
+        self::$config_loaded = false;
         self::auto_detect_system();
+    }
+
+    /**
+     * Initialize paths and load configuration exactly once for public APIs.
+     *
+     * @param string $path Optional application root.
+     * @return void
+     */
+    private static function ensure_initialized($path = "") {
+        if (!self::$initialized || $path !== '') {
+            self::init($path);
+        }
+        if (!self::$config_loaded) {
+            self::load_config();
+        }
     }
 
     /**
@@ -753,34 +854,24 @@ class lykan {
      * @return void
      */
     public static function run($path = "") {
-        self::init($path);
-        self::load_config();
-        if ($handle = opendir(lykan_config::$config['hpath'])) {
-            while (false !== ($file = readdir($handle))) {
-                if (!self::is_request_cache_filename($file)) {
-                    continue;
-                }
-                $fname = lykan_config::$config['hpath'] . $file;
-                $modified_at = is_file($fname) ? filemtime($fname) : false;
-                if ($modified_at === false) {
-                    self::log_runtime_error('Unable to read request-cache modification time: ' . $fname);
-                    continue;
-                }
-                if ((time() - $modified_at) > (lykan_config::$config['hcache_lifetime_hours'] * 3600)) {
-                    if (!unlink($fname)) {
-                        self::log_runtime_error('Unable to remove expired request cache: ' . $fname);
-                    }
-                }
-            }
-            closedir($handle);
-        }
+        self::ensure_initialized($path);
+        self::maybe_cleanup_request_cache();
 
         $user_agent = self::get_user_agent();
-        $fname = (stripos($user_agent, 'bot') !== false) ? $user_agent : $user_agent . self::get_the_ip();
-        $hfile = lykan_config::$config['hpath'] . md5($fname);
-        self::update_locked_file($hfile, function ($current) use ($user_agent) {
+        $identity = (stripos($user_agent, 'bot') !== false) ? $user_agent : $user_agent . self::get_the_ip();
+        $bucket_count = max(16, min(65536, (int)(lykan_config::$config['request_cache_bucket_count'] ?? 1024)));
+        // Seven hexadecimal digits also stay within the integer range on
+        // 32-bit PHP builds.
+        $bucket = hexdec(substr(hash('sha256', $identity), 0, 7)) % $bucket_count;
+        $hfile = lykan_config::$config['hpath'] . md5('request-cache-bucket:' . $bucket);
+        self::update_locked_file($hfile, function ($current) use ($user_agent, $hfile) {
+            $modified_at = is_file($hfile) ? filemtime($hfile) : false;
+            $max_age = max(1, (int)lykan_config::$config['hcache_lifetime_hours']) * 3600;
+            if ($modified_at !== false && (time() - $modified_at) > $max_age) {
+                $current = '';
+            }
             $arr = explode(PHP_EOL, $current);
-            $hcount = ($current === '') ? 0 : ((int)($arr[0] ?? 0) + 1);
+            $hcount = ($current === '') ? 1 : ((int)($arr[0] ?? 0) + 1);
             return implode(PHP_EOL, array(
                 $hcount,
                 $user_agent,
@@ -797,7 +888,9 @@ class lykan {
         self::sql_detect();
         self::clear_blocked();
         self::block_ips_and_bots_from_blacklist();
-        lykan_exploit::check_for_exploit();
+        if (self::is_filter_active('exploit')) {
+            lykan_exploit::check_for_exploit();
+        }
         self::payloadlog();
         #self::check_agent();
 
@@ -827,6 +920,41 @@ class lykan {
      */
     private static function is_request_cache_filename($filename) {
         return preg_match('/^[a-f0-9]{32}$/i', (string)$filename) === 1;
+    }
+
+    /**
+     * Remove expired request-cache buckets occasionally instead of scanning the
+     * directory on every request. Bucketed filenames put a hard upper bound on
+     * the number of files that new client identities can create.
+     *
+     * @return void
+     */
+    private static function maybe_cleanup_request_cache() {
+        $probability = max(1, (int)(lykan_config::$config['request_cache_cleanup_probability'] ?? 100));
+        if (mt_rand(1, $probability) !== 1) {
+            return;
+        }
+
+        self::prune_local_bad_ips_file();
+        self::cleanup_runtime_artifacts();
+
+        $max_age = max(1, (int)lykan_config::$config['hcache_lifetime_hours']) * 3600;
+        $handle = @opendir(lykan_config::$config['hpath']);
+        if ($handle === false) {
+            return;
+        }
+
+        while (false !== ($file = readdir($handle))) {
+            if (!self::is_request_cache_filename($file)) {
+                continue;
+            }
+            $path = lykan_config::$config['hpath'] . $file;
+            $modified_at = is_file($path) ? filemtime($path) : false;
+            if ($modified_at !== false && (time() - $modified_at) > $max_age && !unlink($path)) {
+                self::log_runtime_error('Unable to remove expired request cache: ' . $path);
+            }
+        }
+        closedir($handle);
     }
 
     /**
@@ -877,21 +1005,26 @@ class lykan {
      */
     private static function block_ips_and_bots_from_blacklist() {
         $user_agent = self::get_user_agent();
-        $json = json_decode(self::get_current_pattern(), true);
+        $json = self::get_current_pattern_data();
+        $client_ip = self::get_the_ip();
 
         # check bad IPs ( include IPs from stock DB and lykan network )
         if (isset($json['badips']) && is_array($json['badips'])) {
-            if (isset($json['badips'][self::get_the_ip()])) {
+            if (isset($json['badips'][$client_ip])) {
                 self::report_hack(lykan_types::BAD_IP, "", false);
-                self::exit_env(lykan_types::BAD_IP . ' ' . self::get_the_ip());
+                self::exit_env(lykan_types::BAD_IP . ' ' . $client_ip);
             }
+        }
+        elseif (self::is_ip_in_blacklist_shard($client_ip)) {
+            self::report_hack(lykan_types::BAD_IP, "", false);
+            self::exit_env(lykan_types::BAD_IP . ' ' . $client_ip);
         }
 
         #check bots
         if (isset($json['bots']) && is_array($json['bots'])) {
             foreach ((array )$json['bots'] as $row) {
-                $bot_key = trim(strtolower($row['b_bot']));
-                if (!empty($bot_key) && strstr($user_agent, $bot_key)) {
+                $bot_key = isset($row['b_bot']) ? trim((string)$row['b_bot']) : '';
+                if ($bot_key !== '' && stripos($user_agent, $bot_key) !== false) {
                     self::report_hack(lykan_types::BLACK_LIST_BOT, "", false);
                     self::exit_env('BLACK_LIST_BOT');
                 }
@@ -907,14 +1040,18 @@ class lykan {
      */
     protected static function block_bad_bots() {
         if (self::is_filter_active('bad_bots') === true) {
-            $badbots = self::read_bad_bots_from_cachefile();
-            if ($_SERVER['HTTP_USER_AGENT'] != str_ireplace($badbots, '*', $_SERVER['HTTP_USER_AGENT'])) {
+            $user_agent = self::get_user_agent();
+            foreach (self::read_bad_bots_from_cachefile() as $badbot) {
+                $badbot = trim((string)$badbot);
+                if ($badbot === '' || stripos($user_agent, $badbot) === false) {
+                    continue;
+                }
                 self::append_locked_file(lykan_config::$config['lykan_blocked_file'], implode("\t", array(
                     date('Y-m-d H:i:s'),
-                    self::get_user_agent(),
+                    $user_agent,
                     'AGENT',
                     self::get_the_ip())) . PHP_EOL);
-                self::report_hack(lykan_types::BAD_BOT, self::get_user_agent());
+                self::report_hack(lykan_types::BLACK_LIST_BOT, $user_agent);
                 self::exit_env('BOT');
             }
         }
@@ -950,17 +1087,42 @@ class lykan {
      * @return void
      */
     public static function read_logs() {
-        $k = 0;
-        $result['hour_log'] = $result['blocked_bots'] = array();
+        self::ensure_initialized();
+        $result = array(
+            'hour_log' => array(),
+            'request_buckets' => array(),
+            'blocked_bots' => array(),
+            'hour_log_count' => 0,
+            'request_bucket_count' => 0,
+            'request_count_estimate' => 0,
+            'statistics_are_approximate' => true
+        );
+        $max_age = max(1, (int)lykan_config::$config['hcache_lifetime_hours']) * 3600;
         if ($handle = opendir(lykan_config::$config['hpath'])) {
             while (false !== ($file = readdir($handle))) {
-                if ($file !== '.' && $file !== '..') {
-                    $contents = self::read_locked_file(lykan_config::$config['hpath'] . $file);
-                    if (is_string($contents)) {
-                        $result['hour_log'][] = preg_split('/\R/', $contents);
-                    }
+                if (!self::is_request_cache_filename($file)) {
+                    continue;
                 }
-                $k++;
+                $path = lykan_config::$config['hpath'] . $file;
+                $modified_at = is_file($path) ? filemtime($path) : false;
+                if ($modified_at === false || (time() - $modified_at) > $max_age) {
+                    continue;
+                }
+                $contents = self::read_locked_file($path);
+                if (!is_string($contents)) {
+                    continue;
+                }
+                $row = preg_split('/\R/', trim($contents));
+                $count = max(0, (int)($row[0] ?? 0));
+                $bucket = array(
+                    'request_count' => $count,
+                    'sample_user_agent' => (string)($row[1] ?? ''),
+                    'sample_ip' => (string)($row[2] ?? ''),
+                    'last_seen' => (string)($row[3] ?? '')
+                );
+                $result['request_buckets'][] = $bucket;
+                $result['hour_log'][] = array($count, $bucket['sample_user_agent'], $bucket['sample_ip'], $bucket['last_seen']);
+                $result['request_count_estimate'] += $count;
             }
             closedir($handle);
         }
@@ -971,7 +1133,9 @@ class lykan {
                 $result['blocked_bots'][] = explode("\t", $line);
             }
         }
-        $result['hour_log_count'] = $k;
+        $result['request_bucket_count'] = count($result['request_buckets']);
+        // Backward-compatible key: this is a bucket count, not a unique-client count.
+        $result['hour_log_count'] = $result['request_bucket_count'];
         return $result;
     }
 
@@ -1141,7 +1305,13 @@ class lykan {
     protected static function get_locale_bad_ips() {
         if (is_file(lykan_config::$config['badips_file'])) {
             $contents = self::read_locked_file(lykan_config::$config['badips_file']);
-            return is_string($contents) ? preg_split('/\R/', $contents, -1, PREG_SPLIT_NO_EMPTY) : array();
+            if (!is_string($contents)) {
+                return array();
+            }
+            $fallback = filemtime(lykan_config::$config['badips_file']);
+            $records = self::decode_local_bad_ip_records($contents, $fallback === false ? time() : $fallback);
+            $records = self::prune_local_bad_ip_records($records);
+            return array_keys($records);
         }
         else
             return array();
@@ -1172,7 +1342,7 @@ class lykan {
      * @return array
      */
     public static function get_backend() {
-        self::init();
+        self::ensure_initialized();
         return array(
             'bad_ips' => (implode(PHP_EOL, self::get_locale_bad_ips())),
             'bad_bots' => (implode(PHP_EOL, self::read_bad_bots_from_cachefile())),
@@ -1187,12 +1357,13 @@ class lykan {
      * @return void
      */
     public static function add_ip($ip) {
+        self::ensure_initialized();
         $ip = self::normalize_blocked_ip_entry($ip);
         if ($ip !== '') {
             self::update_locked_file(lykan_config::$config['badips_file'], function ($current) use ($ip) {
-                $ip_list = preg_split('/\R/', trim($current), -1, PREG_SPLIT_NO_EMPTY);
-                $ip_list[] = trim($ip);
-                return implode(PHP_EOL, array_unique($ip_list));
+                $records = self::decode_local_bad_ip_records($current, time());
+                $records[$ip] = time();
+                return self::encode_local_bad_ip_records(self::prune_local_bad_ip_records($records));
             });
         }
     }
@@ -1204,17 +1375,19 @@ class lykan {
      * @return void
      */
     public static function save(array $ip_list) {
-        self::init();
+        self::ensure_initialized();
         $ip_list = array_unique($ip_list);
         $arr = [];
         foreach ($ip_list as $ip) {
             $ip = self::normalize_blocked_ip_entry($ip);
             if ($ip !== '') {
-                $arr[] = $ip;
+                $arr[$ip] = time();
             }
         }
-        $arr = array_unique($arr);
-        return self::write_locked_file(lykan_config::$config['badips_file'], implode(PHP_EOL, $arr));
+        return self::write_locked_file(
+            lykan_config::$config['badips_file'],
+            self::encode_local_bad_ip_records(self::prune_local_bad_ip_records($arr))
+        );
     }
 
     /**
@@ -1224,14 +1397,94 @@ class lykan {
      * @return void
      */
     public static function remove_ip($ip) {
+        self::ensure_initialized();
         $ip = self::normalize_blocked_ip_entry($ip);
         if ($ip === '') {
             return false;
         }
         return self::update_locked_file(lykan_config::$config['badips_file'], function ($current) use ($ip) {
-            $ip_list = preg_split('/\R/', trim($current), -1, PREG_SPLIT_NO_EMPTY);
-            $ip_list = array_diff($ip_list, array($ip));
-            return implode(PHP_EOL, $ip_list);
+            $records = self::decode_local_bad_ip_records($current, time());
+            unset($records[$ip]);
+            return self::encode_local_bad_ip_records(self::prune_local_bad_ip_records($records));
+        });
+    }
+
+    /**
+     * Decode both legacy one-IP-per-line files and timestamped entries.
+     *
+     * @param string $contents File contents.
+     * @param int $legacy_timestamp Timestamp assigned to legacy entries.
+     * @return array<string,int>
+     */
+    private static function decode_local_bad_ip_records($contents, $legacy_timestamp) {
+        $records = array();
+        foreach (preg_split('/\R/', trim((string)$contents), -1, PREG_SPLIT_NO_EMPTY) as $line) {
+            $parts = explode("\t", (string)$line, 2);
+            if (count($parts) === 2 && ctype_digit($parts[0])) {
+                $timestamp = (int)$parts[0];
+                $entry = self::normalize_blocked_ip_entry($parts[1]);
+            }
+            else {
+                $timestamp = (int)$legacy_timestamp;
+                $entry = self::normalize_blocked_ip_entry($line);
+            }
+            if ($entry !== '') {
+                $records[$entry] = max($timestamp, (int)($records[$entry] ?? 0));
+            }
+        }
+        return $records;
+    }
+
+    /**
+     * Apply expiry and entry-count limits, retaining the newest entries.
+     *
+     * @param array<string,int> $records IP entry to creation timestamp.
+     * @return array<string,int>
+     */
+    private static function prune_local_bad_ip_records(array $records) {
+        $lifetime = max(1, (int)(lykan_config::$config['local_bad_ip_lifetime_hours'] ?? 720)) * 3600;
+        $cutoff = time() - $lifetime;
+        foreach ($records as $entry => $timestamp) {
+            if ((int)$timestamp < $cutoff) {
+                unset($records[$entry]);
+            }
+        }
+        arsort($records, SORT_NUMERIC);
+        $max_entries = max(1, (int)(lykan_config::$config['local_bad_ip_max_entries'] ?? 5000));
+        return array_slice($records, 0, $max_entries, true);
+    }
+
+    /**
+     * Encode timestamped local blocked-IP records.
+     *
+     * @param array<string,int> $records IP entry to creation timestamp.
+     * @return string
+     */
+    private static function encode_local_bad_ip_records(array $records) {
+        $lines = array();
+        foreach ($records as $entry => $timestamp) {
+            $lines[] = (int)$timestamp . "\t" . $entry;
+        }
+        return count($lines) > 0 ? implode(PHP_EOL, $lines) . PHP_EOL : '';
+    }
+
+    /**
+     * Persist expiry/count pruning without changing active entries.
+     *
+     * @return void
+     */
+    private static function prune_local_bad_ips_file() {
+        $path = lykan_config::$config['badips_file'];
+        if (!is_file($path)) {
+            return;
+        }
+        $fallback = filemtime($path);
+        self::update_locked_file($path, function ($current) use ($fallback) {
+            $records = self::decode_local_bad_ip_records(
+                $current,
+                $fallback === false ? time() : $fallback
+            );
+            return self::encode_local_bad_ip_records(self::prune_local_bad_ip_records($records));
         });
     }
 
@@ -1275,7 +1528,9 @@ class lykan {
      * @return string
      */
     private static function get_query_string() {
-        return $_SERVER['QUERY_STRING'];
+        $query = isset($_SERVER['QUERY_STRING']) ? (string)$_SERVER['QUERY_STRING'] : '';
+        $max_bytes = max(256, (int)(lykan_config::$config['request_inspection_max_bytes'] ?? 8192));
+        return strlen($query) > $max_bytes ? substr($query, 0, $max_bytes) : $query;
     }
 
     /**
@@ -1286,10 +1541,15 @@ class lykan {
     private static function worm_detect() {
         self::detect_worm_injection('worm', lykan_types::WORM_INJECT);
         $check = $cracktrack = self::get_query_string();
-        $json = json_decode(self::get_current_pattern(), true);
+        $json = self::get_current_pattern_data();
         if (isset($json['xssinject']) && is_array($json['xssinject'])) {
             foreach ((array )$json['xssinject'] as $row) {
-                $cracktrack = preg_replace((string )$row['i_term'], '*', $cracktrack);
+                $matched = false;
+                $updated = self::apply_remote_regex((string)$row['i_term'], $cracktrack, $matched);
+                if ($updated === false) {
+                    continue;
+                }
+                $cracktrack = $updated;
             }
             if ($cracktrack != $check) {
                 self::report_hack(lykan_types::XSS_INJECT);
@@ -1367,8 +1627,7 @@ class lykan {
         $patterns = array();
 
         // load JSON patterns (tolerant)
-        $json_raw = self::get_current_pattern();
-        $json = json_decode($json_raw, true);
+        $json = self::get_current_pattern_data();
         if (is_array($json)) {
             foreach ($json as $section_key => $section) {
                 if (!is_array($section))
@@ -1391,7 +1650,7 @@ class lykan {
         $patterns = array_values(array_unique(array_map('trim', $patterns)));
         $lc_patterns = array();
         foreach ($patterns as $p) {
-            $lc_patterns[] = mb_strtolower($p, 'UTF-8');
+            $lc_patterns[] = self::lower_utf8($p);
         }
 
         // collect inputs (uses your existing helper)
@@ -1428,7 +1687,7 @@ class lykan {
             // also lowercased variants for case-insensitive substring search
             $lc_variants = array();
             foreach ($variants as $v) {
-                $lc_variants[] = mb_strtolower($v, 'UTF-8');
+                $lc_variants[] = self::lower_utf8($v);
             }
 
             // 2) pattern matching (plain substring, case-insensitive)
@@ -1438,7 +1697,7 @@ class lykan {
                 foreach ($lc_variants as $v) {
                     if ($v === '')
                         continue;
-                    if (mb_strpos($v, $pattern, 0, 'UTF-8') !== false) {
+                    if (self::strpos_utf8($v, $pattern) !== false) {
                         $detections[] = array(
                             'type' => 'pattern',
                             'pattern' => $patterns[$idx], // original pattern
@@ -1578,9 +1837,7 @@ class lykan {
                 }
 
                 // ensure UTF-8 (json_encode later requires UTF-8)
-                if (!mb_check_encoding($s, 'UTF-8')) {
-                    $s = mb_convert_encoding($s, 'UTF-8', 'auto');
-                }
+                $s = self::normalize_utf8($s);
 
                 $result[] = $s;
             }
@@ -1632,6 +1889,7 @@ class lykan {
      * @return void
      */
     public static function detect_worm_injection($type, $itype) {
+        self::ensure_initialized();
         // quick guard: is detection active?
         if (!self::is_filter_active($type . '_injection')) {
             return false;
@@ -1644,8 +1902,7 @@ class lykan {
         }
 
         // load JSON patterns once, tolerant parsing
-        $json_raw = self::get_current_pattern();
-        $json = @json_decode($json_raw, true);
+        $json = self::get_current_pattern_data();
         if (!is_array($json)) {
             return false;
         }
@@ -1687,7 +1944,7 @@ class lykan {
             $p = trim($p);
             if ($p === '')
                 continue;
-            $lc_patterns[mb_strtolower($p, 'UTF-8')] = $p; // keep original as value for reporting
+            $lc_patterns[self::lower_utf8($p)] = $p; // keep original as value for reporting
         }
         if (empty($lc_patterns))
             return false;
@@ -1702,7 +1959,7 @@ class lykan {
         // lowercased variants for case-insensitive search
         $lc_variants = array();
         foreach ($variants as $v) {
-            $lc_variants[] = mb_strtolower($v, 'UTF-8');
+            $lc_variants[] = self::lower_utf8($v);
         }
 
         // iterate patterns and variants and stop on first match (fast path)
@@ -1712,9 +1969,9 @@ class lykan {
             foreach ($lc_variants as $variant) {
                 if ($variant === '')
                     continue;
-                if (mb_strpos($variant, $lc_pat, 0, 'UTF-8') !== false) {
+                if (self::strpos_utf8($variant, $lc_pat) !== false) {
                     $matched_pattern = $orig_pat;
-                    $matched_variant_snippet = mb_substr($variant, 0, 300, 'UTF-8');
+                    $matched_variant_snippet = self::substr_utf8($variant, 0, 300);
                     break 2;
                 }
             }
@@ -1814,6 +2071,7 @@ class lykan {
      * @return bool
      */
     public static function report_hack($h_type, $h_type_info = "", $adddb = true) {
+        self::ensure_initialized();
         $type_info = preg_replace('/[\r\n\t\0]+/', ' ', (string)$h_type_info);
         $event = array(
             'cmd' => 'report_hack',
@@ -1860,6 +2118,7 @@ class lykan {
      * @return int Number of successfully delivered reports.
      */
     public static function flush_report_queue($limit = 20) {
+        self::ensure_initialized();
         $limit = max(1, min(100, (int)$limit));
         $queue_path = self::get_report_queue_path();
         if (!is_file($queue_path)) {
@@ -1924,9 +2183,21 @@ class lykan {
         }
         self::$report_flush_scheduled = true;
         register_shutdown_function(function () {
-            fastcgi_finish_request();
+            self::finish_response_once();
             self::flush_report_queue(5);
         });
+    }
+
+    /**
+     * Finish a PHP-FPM response once before post-response maintenance.
+     *
+     * @return void
+     */
+    private static function finish_response_once() {
+        if (!self::$response_finished && function_exists('fastcgi_finish_request')) {
+            self::$response_finished = true;
+            fastcgi_finish_request();
+        }
     }
 
 
@@ -1938,6 +2209,7 @@ class lykan {
      * @return array|null
      */
     public static function get_lock($days, $limit = 0) {
+        self::ensure_initialized();
         $domain = self::get_host();
         $days = (int)$days;
         $arr = array(
@@ -1952,104 +2224,366 @@ class lykan {
 
     /**
      * lykan::get_current_pattern()
-     * 
-     * @return void
+     *
+     * @return string Current blacklist JSON or an empty JSON object.
      */
     public static function get_current_pattern() {
+        self::ensure_initialized();
         $path = lykan_config::$config['lykan_blacklist'];
         $lifetime_hours = isset(lykan_config::$config['blacklist_lifetime_hours']) ? (int)lykan_config::$config['blacklist_lifetime_hours'] : 0;
-        $lock_ttl = isset(lykan_config::$config['download_lock_ttl_seconds']) ? (int)lykan_config::$config['download_lock_ttl_seconds'] : 300; // 5 minutes
-        $lock_path = $path . '.lock';
 
-        $need_download = false;
+        if (self::$blacklist_cache_path !== $path) {
+            self::reset_blacklist_cache($path);
+        }
+        elseif (is_string(self::$blacklist_raw_cache)) {
+            return self::$blacklist_raw_cache;
+        }
 
+        $refresh_due = false;
+        $has_usable_rules = false;
 
-        // 1) Decide if refresh is needed.
+        // 1) Use inexpensive file metadata to decide whether a refresh is due.
         if (is_file($path)) {
             $modified_at = filemtime($path);
             if ($modified_at === false) {
                 self::log_runtime_error('Unable to read blacklist modification time: ' . $path);
-                $need_download = true;
+                $refresh_due = true;
             }
             elseif ((time() - $modified_at) > ($lifetime_hours * 3600)) {
-                $need_download = true;
+                $refresh_due = true;
             }
         }
         else {
-            $need_download = true;
+            $refresh_due = true;
         }
 
-        // 2) Empty or invalid JSON requires a refresh.
+        // 2) Decode an existing file once per request. Entry-by-entry validation
+        // is intentionally reserved for newly downloaded data.
         if (is_file($path)) {
             $size = filesize($path);
             if ($size === false) {
                 self::log_runtime_error('Unable to read blacklist size: ' . $path);
-                $need_download = true;
+                $refresh_due = true;
             }
             elseif ($size === 0) {
-                $need_download = true;
+                $refresh_due = true;
+            }
+            elseif (!self::load_blacklist_cache($path)) {
+                $refresh_due = true;
             }
             else {
-                $json_str = file_get_contents($path);
-                if ($json_str === false || !self::is_valid_blacklist_json($json_str)) {
-                    if ($json_str === false) {
-                        self::log_runtime_error('Unable to read blacklist: ' . $path);
-                    }
-                    $need_download = true;
-                }
-                else {
-                    $data = json_decode($json_str, true);
-                    if (is_array($data) && count($data) === 0) {
-                        $need_download = true;
-                    }
-                }
+                $has_usable_rules = true;
             }
         }
 
-        // 3) Acquire the lock by exclusively creating the lock file. fopen(x)
-        // succeeds for exactly one process and therefore acts as the mutex.
-        if ($need_download) {
-            if (is_file($lock_path)) {
-                $lock_modified_at = filemtime($lock_path);
-                if ($lock_modified_at !== false && (time() - $lock_modified_at) >= $lock_ttl) {
-                    if (!unlink($lock_path)) {
-                        self::log_runtime_error('Unable to remove stale blacklist lock: ' . $lock_path);
-                    }
-                }
-            }
-
-            $lock_handle = @fopen($lock_path, 'x');
-            if ($lock_handle !== false) {
-                try {
-                    fwrite($lock_handle, getmypid() . "\t" . time());
-                    fflush($lock_handle);
-                    self::download_pattern();
-                }
-                catch (\Throwable $e) {
-                    self::log_runtime_error('Blacklist update failed: ' . $e->getMessage());
-                }
-                finally {
-                    fclose($lock_handle);
-                    if (is_file($lock_path) && !unlink($lock_path)) {
-                        self::log_runtime_error('Unable to remove blacklist lock: ' . $lock_path);
-                    }
-                }
-            }
+        // Serve valid stale rules immediately. PHP-FPM can refresh them after
+        // the response; other SAPIs should invoke refresh_rules() from cron.
+        if ($refresh_due && $has_usable_rules) {
+            self::schedule_rule_refresh();
+            return self::$blacklist_raw_cache;
         }
 
-        // 4) Return the best available valid JSON.
-        if (is_file($path)) {
-            $json_str = file_get_contents($path);
-            if ($json_str !== false && self::is_valid_blacklist_json($json_str)) {
-                return $json_str;
-            }
-            if ($json_str === false) {
-                self::log_runtime_error('Unable to read current blacklist: ' . $path);
-            }
+        // Never make a remote refresh part of request filtering. A first
+        // installation temporarily follows rules_unavailable_action while
+        // PHP-FPM refreshes after the response or a scheduled CLI task runs.
+        if ($refresh_due && !$has_usable_rules) {
+            self::schedule_rule_refresh();
+        }
+
+        // 4) A successful download has already populated the request cache.
+        // Otherwise keep using a syntactically valid existing file while another
+        // process performs the refresh.
+        if (is_string(self::$blacklist_raw_cache)) {
+            return self::$blacklist_raw_cache;
+        }
+        if (is_file($path) && self::load_blacklist_cache($path)) {
+            return self::$blacklist_raw_cache;
         }
 
         // Do not overwrite a previously usable file with fallback data.
         return json_encode(array());
+    }
+
+    /**
+     * Explicitly refresh remote rules. Intended for cron jobs and CLI workers.
+     *
+     * @param string $path Optional application root.
+     * @return bool True when new rules were installed.
+     */
+    public static function refresh_rules($path = "") {
+        self::ensure_initialized($path);
+        $target = lykan_config::$config['lykan_blacklist'];
+        $lock_path = $target . '.lock';
+        $lock_ttl = max(30, (int)(lykan_config::$config['download_lock_ttl_seconds'] ?? 300));
+
+        if (is_file($lock_path)) {
+            $modified_at = filemtime($lock_path);
+            if ($modified_at !== false && (time() - $modified_at) >= $lock_ttl && !unlink($lock_path)) {
+                self::log_runtime_error('Unable to remove stale blacklist lock: ' . $lock_path);
+            }
+        }
+
+        $lock_handle = @fopen($lock_path, 'x');
+        if ($lock_handle === false) {
+            return false;
+        }
+
+        try {
+            fwrite($lock_handle, getmypid() . "\t" . time());
+            fflush($lock_handle);
+            return self::download_pattern();
+        }
+        catch (\Throwable $e) {
+            self::log_runtime_error('Blacklist update failed: ' . $e->getMessage());
+            return false;
+        }
+        finally {
+            fclose($lock_handle);
+            if (is_file($lock_path) && !unlink($lock_path)) {
+                self::log_runtime_error('Unable to remove blacklist lock: ' . $lock_path);
+            }
+        }
+    }
+
+    /**
+     * Schedule stale-rule refresh after a PHP-FPM response.
+     *
+     * @return void
+     */
+    private static function schedule_rule_refresh() {
+        if (self::$rule_refresh_scheduled
+            || empty(lykan_config::$config['refresh_rules_after_response'])
+            || !function_exists('fastcgi_finish_request')) {
+            return;
+        }
+        self::$rule_refresh_scheduled = true;
+        register_shutdown_function(function () {
+            self::finish_response_once();
+            self::refresh_rules();
+        });
+    }
+
+    /**
+     * Return the decoded blacklist and reuse it in every filter during this request.
+     *
+     * @return array
+     */
+    private static function get_current_pattern_data() {
+        self::get_current_pattern();
+        $rules = is_array(self::$blacklist_data_cache) ? self::$blacklist_data_cache : array();
+        if (count($rules) === 0 && self::should_block_when_rules_unavailable('blacklist and detection rules')) {
+            self::exit_env('RULES_UNAVAILABLE');
+        }
+        return $rules;
+    }
+
+    /**
+     * Apply the configured policy when remotely maintained rules are missing.
+     *
+     * @param string $context Missing rule set.
+     * @return bool True when the request must be blocked.
+     */
+    private static function should_block_when_rules_unavailable($context) {
+        $action = strtolower(trim((string)(lykan_config::$config['rules_unavailable_action'] ?? 'monitor')));
+        $block = $action === 'block';
+        if (!self::$rules_unavailable_reported) {
+            self::$rules_unavailable_reported = true;
+            self::log_runtime_error_rate_limited(
+                'rules-unavailable-' . ($block ? 'block' : 'monitor'),
+                $context . ' unavailable; request policy is ' . ($block ? 'block' : 'monitor') . '.'
+            );
+        }
+        return $block;
+    }
+
+    /**
+     * Execute a downloaded regular expression with local PCRE resource limits.
+     *
+     * @param string $pattern Validated delimited PCRE pattern.
+     * @param string $subject Input to inspect.
+     * @param bool $matched Set to true when the expression matched.
+     * @return string|false Replaced subject, or false for an invalid/failed regex.
+     */
+    private static function apply_remote_regex($pattern, $subject, &$matched = false) {
+        $matched = false;
+        $pattern = (string)$pattern;
+        $max_pattern = max(32, (int)(lykan_config::$config['remote_regex_max_pattern_bytes'] ?? 512));
+        if ($pattern === '' || strlen($pattern) > $max_pattern) {
+            return false;
+        }
+
+        $max_subject = max(256, (int)(lykan_config::$config['request_inspection_max_bytes'] ?? 8192));
+        $subject = substr((string)$subject, 0, $max_subject);
+        $limited_pattern = substr($pattern, 0, 1)
+            . '(*LIMIT_MATCH=100000)(*LIMIT_DEPTH=1000)'
+            . substr($pattern, 1);
+        $result = @preg_replace($limited_pattern, '*', $subject, -1, $count);
+        if ($result === null || preg_last_error() !== PREG_NO_ERROR) {
+            self::log_runtime_error_rate_limited(
+                'remote-regex-failure',
+                'Remote regular expression exceeded limits or failed.'
+            );
+            return false;
+        }
+        $matched = $count > 0;
+        return $result;
+    }
+
+    /**
+     * UTF-8 helpers that keep detection operational without ext-mbstring.
+     */
+    private static function lower_utf8($value) {
+        return function_exists('mb_strtolower')
+            ? mb_strtolower((string)$value, 'UTF-8')
+            : strtolower((string)$value);
+    }
+
+    private static function strpos_utf8($haystack, $needle) {
+        return function_exists('mb_strpos')
+            ? mb_strpos((string)$haystack, (string)$needle, 0, 'UTF-8')
+            : strpos((string)$haystack, (string)$needle);
+    }
+
+    private static function substr_utf8($value, $start, $length) {
+        return function_exists('mb_substr')
+            ? mb_substr((string)$value, (int)$start, (int)$length, 'UTF-8')
+            : substr((string)$value, (int)$start, (int)$length);
+    }
+
+    private static function normalize_utf8($value) {
+        $value = (string)$value;
+        if (!function_exists('mb_check_encoding') || mb_check_encoding($value, 'UTF-8')) {
+            return $value;
+        }
+        return function_exists('mb_convert_encoding')
+            ? mb_convert_encoding($value, 'UTF-8', 'auto')
+            : $value;
+    }
+
+    /**
+     * Reset the in-memory blacklist cache when its configured path changes.
+     *
+     * @param string $path Blacklist file path.
+     * @return void
+     */
+    private static function reset_blacklist_cache($path) {
+        self::$blacklist_raw_cache = null;
+        self::$blacklist_data_cache = null;
+        self::$blacklist_cache_path = (string)$path;
+        self::$blacklist_shard_manifest_cache = null;
+        self::$blacklist_ip_shard_cache = array();
+    }
+
+    /**
+     * Read and decode an installed blacklist once without revalidating all entries.
+     *
+     * @param string $path Blacklist file path.
+     * @return bool
+     */
+    private static function load_blacklist_cache($path) {
+        if (is_string(self::$blacklist_raw_cache) && is_array(self::$blacklist_data_cache)) {
+            return true;
+        }
+
+        $json = @file_get_contents($path);
+        if ($json === false) {
+            self::log_runtime_error('Unable to read current blacklist: ' . $path);
+            return false;
+        }
+
+        $data = json_decode($json, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($data) || count($data) === 0) {
+            self::log_runtime_error('Installed blacklist contains invalid JSON: ' . $path);
+            return false;
+        }
+
+        self::$blacklist_raw_cache = $json;
+        self::$blacklist_data_cache = $data;
+        self::$blacklist_cache_path = (string)$path;
+        return true;
+    }
+
+    /**
+     * Check an IP address in the small prefix shard assigned to that address.
+     *
+     * @param string $ip Client IP address.
+     * @return bool
+     */
+    private static function is_ip_in_blacklist_shard($ip) {
+        $normalized_ip = self::normalize_blacklist_ip($ip);
+        $shard_key = self::get_blacklist_shard_key($normalized_ip);
+        if ($normalized_ip === false || $shard_key === false) {
+            return false;
+        }
+
+        $manifest = self::get_blacklist_shard_manifest();
+        if (!is_array($manifest) || empty($manifest['version'])) {
+            return false;
+        }
+
+        $cache_key = $manifest['version'] . ':' . $shard_key;
+        if (!array_key_exists($cache_key, self::$blacklist_ip_shard_cache)) {
+            $target = lykan_config::$config['lykan_blacklist'];
+            $shard_file = $target . '.shards.' . $manifest['version'] . DIRECTORY_SEPARATOR . $shard_key . '.json';
+            $json = @file_get_contents($shard_file);
+            $entries = $json === false ? null : json_decode($json, true);
+            self::$blacklist_ip_shard_cache[$cache_key] = is_array($entries) ? $entries : array();
+        }
+
+        return isset(self::$blacklist_ip_shard_cache[$cache_key][$normalized_ip]);
+    }
+
+    /**
+     * Read the atomically published shard manifest once per request.
+     *
+     * @return array|null
+     */
+    private static function get_blacklist_shard_manifest() {
+        if (self::$blacklist_shard_manifest_cache !== null) {
+            return self::$blacklist_shard_manifest_cache;
+        }
+
+        $manifest_file = lykan_config::$config['lykan_blacklist'] . '.shards.json';
+        $json = @file_get_contents($manifest_file);
+        $manifest = $json === false ? null : json_decode($json, true);
+        if (!is_array($manifest)
+            || !isset($manifest['version'])
+            || preg_match('/^[a-f0-9]{16}$/D', (string)$manifest['version']) !== 1) {
+            self::$blacklist_shard_manifest_cache = array();
+            return self::$blacklist_shard_manifest_cache;
+        }
+
+        self::$blacklist_shard_manifest_cache = $manifest;
+        return self::$blacklist_shard_manifest_cache;
+    }
+
+    /**
+     * Return a canonical representation of an IPv4 or IPv6 address.
+     *
+     * @param string $ip IP address.
+     * @return string|false
+     */
+    private static function normalize_blacklist_ip($ip) {
+        $binary = @inet_pton((string)$ip);
+        return $binary === false ? false : inet_ntop($binary);
+    }
+
+    /**
+     * Map an IP address to one of at most 512 first-byte shards.
+     *
+     * @param string|false $ip Canonical IP address.
+     * @return string|false
+     */
+    private static function get_blacklist_shard_key($ip) {
+        if (!is_string($ip)) {
+            return false;
+        }
+        $binary = @inet_pton($ip);
+        if ($binary === false) {
+            return false;
+        }
+        $family = strlen($binary) === 4 ? '4' : (strlen($binary) === 16 ? '6' : '');
+        return $family === '' ? false : $family . '-' . bin2hex($binary[0]);
     }
 
 
@@ -2083,8 +2617,34 @@ class lykan {
             }
 
             $json = file_get_contents($temp_file);
-            if (!self::is_valid_blacklist_json($json)) {
+            $decoded_data = null;
+            if (!self::is_valid_blacklist_json($json, $decoded_data)) {
                 error_log('Lykan blacklist update rejected: downloaded data is not a valid blacklist.');
+                return false;
+            }
+
+            $badips = isset($decoded_data['badips']) && is_array($decoded_data['badips'])
+                ? $decoded_data['badips']
+                : array();
+            $ip_entry_count = count($badips);
+            $shard_version = self::install_blacklist_ip_shards($target, $badips, $json);
+            if ($shard_version === false) {
+                error_log('Lykan blacklist update failed: IP shards could not be installed.');
+                return false;
+            }
+
+            unset($decoded_data['badips']);
+            $decoded_data['_lykan'] = array(
+                'ip_shards' => $shard_version,
+                'ip_entries' => $ip_entry_count
+            );
+            $rules_json = json_encode($decoded_data, JSON_UNESCAPED_SLASHES);
+            if (!is_string($rules_json)) {
+                error_log('Lykan blacklist update failed: compact rules could not be encoded.');
+                return false;
+            }
+            if (file_put_contents($temp_file, $rules_json, LOCK_EX) === false) {
+                error_log('Lykan blacklist update failed: compact rules could not be written.');
                 return false;
             }
 
@@ -2098,6 +2658,11 @@ class lykan {
             }
 
             $temp_file = '';
+            self::$blacklist_raw_cache = $rules_json;
+            self::$blacklist_data_cache = $decoded_data;
+            self::$blacklist_cache_path = (string)$target;
+            self::$blacklist_shard_manifest_cache = array('version' => $shard_version);
+            self::$blacklist_ip_shard_cache = array();
             return true;
         }
         finally {
@@ -2110,12 +2675,186 @@ class lykan {
     }
 
     /**
+     * Build prefix-sharded IP files and publish their manifest atomically.
+     *
+     * @param string $target Blacklist JSON path.
+     * @param array $badips Validated bad-IP map.
+     * @param string $source_json Original downloaded document.
+     * @return string|false Published shard version or false.
+     */
+    private static function install_blacklist_ip_shards($target, array $badips, $source_json) {
+        $version = substr(hash('sha256', (string)$source_json), 0, 16);
+        $shard_dir = $target . '.shards.' . $version;
+        $created_dir = false;
+
+        if (!is_dir($shard_dir)) {
+            if (!mkdir($shard_dir, 0750)) {
+                return false;
+            }
+            $created_dir = true;
+
+            $shards = array();
+            foreach ($badips as $ip => $entry) {
+                $normalized_ip = self::normalize_blacklist_ip($ip);
+                $shard_key = self::get_blacklist_shard_key($normalized_ip);
+                if ($normalized_ip === false || $shard_key === false) {
+                    self::remove_blacklist_shard_directory($shard_dir);
+                    return false;
+                }
+                $shards[$shard_key][$normalized_ip] = true;
+            }
+
+            foreach ($shards as $shard_key => $entries) {
+                $shard_json = json_encode($entries, JSON_UNESCAPED_SLASHES);
+                $shard_file = $shard_dir . DIRECTORY_SEPARATOR . $shard_key . '.json';
+                if (!is_string($shard_json)
+                    || file_put_contents($shard_file, $shard_json, LOCK_EX) === false
+                    || !chmod($shard_file, 0640)) {
+                    self::remove_blacklist_shard_directory($shard_dir);
+                    return false;
+                }
+            }
+        }
+
+        $manifest = json_encode(array(
+            'version' => $version,
+            'entries' => count($badips),
+            'created_at' => time()
+        ), JSON_UNESCAPED_SLASHES);
+        $manifest_file = $target . '.shards.json';
+        $manifest_temp = tempnam(dirname($target), basename($manifest_file) . '.tmp.');
+        if (!is_string($manifest)
+            || $manifest_temp === false
+            || file_put_contents($manifest_temp, $manifest, LOCK_EX) === false
+            || !chmod($manifest_temp, 0640)
+            || !rename($manifest_temp, $manifest_file)) {
+            if ($manifest_temp !== false && is_file($manifest_temp)) {
+                unlink($manifest_temp);
+            }
+            if ($created_dir) {
+                self::remove_blacklist_shard_directory($shard_dir);
+            }
+            return false;
+        }
+
+        self::remove_old_blacklist_shards($target, $version);
+        return $version;
+    }
+
+    /**
+     * Remove obsolete shard versions after a new manifest was published.
+     *
+     * @param string $target Blacklist JSON path.
+     * @param string $active_version Version that must be retained.
+     * @return void
+     */
+    private static function remove_old_blacklist_shards($target, $active_version) {
+        $pattern = $target . '.shards.*';
+        $previous_versions = array();
+        foreach ((array)glob($pattern, GLOB_ONLYDIR) as $directory) {
+            $suffix = substr($directory, strlen($target . '.shards.'));
+            if ($directory === $target . '.shards.' . $active_version
+                || preg_match('/^[a-f0-9]{16}$/D', (string)$suffix) !== 1) {
+                continue;
+            }
+            $modified_at = filemtime($directory);
+            $previous_versions[$directory] = $modified_at === false ? 0 : $modified_at;
+        }
+
+        // Keep one previous generation so requests that already read the former
+        // manifest can finish safely while the new generation becomes active.
+        arsort($previous_versions, SORT_NUMERIC);
+        $keep_previous = true;
+        foreach ($previous_versions as $directory => $modified_at) {
+            if ($keep_previous) {
+                $keep_previous = false;
+                continue;
+            }
+            self::remove_blacklist_shard_directory($directory);
+        }
+    }
+
+    /**
+     * Remove abandoned download files and incomplete obsolete shard trees.
+     *
+     * Only Lykan-generated names inside the configured blacklist directory are
+     * considered. Recent artifacts are retained to avoid racing an update.
+     *
+     * @return void
+     */
+    private static function cleanup_runtime_artifacts() {
+        $target = isset(lykan_config::$config['lykan_blacklist'])
+            ? (string)lykan_config::$config['lykan_blacklist']
+            : '';
+        if ($target === '' || !is_dir(dirname($target))) {
+            return;
+        }
+
+        $ttl = max(1, (int)(lykan_config::$config['runtime_artifact_lifetime_hours'] ?? 24)) * 3600;
+        $cutoff = time() - $ttl;
+        $temp_patterns = array(
+            $target . '.tmp.*',
+            $target . '.shards.json.tmp.*'
+        );
+        foreach ($temp_patterns as $pattern) {
+            foreach ((array)glob($pattern) as $file) {
+                $modified_at = is_file($file) ? filemtime($file) : false;
+                if ($modified_at !== false && $modified_at < $cutoff && !unlink($file)) {
+                    self::log_runtime_error_rate_limited(
+                        'runtime-artifact-cleanup-file',
+                        'Unable to remove abandoned Lykan temporary file.'
+                    );
+                }
+            }
+        }
+
+        $manifest = self::get_blacklist_shard_manifest();
+        if (is_array($manifest) && !empty($manifest['version'])) {
+            self::remove_old_blacklist_shards($target, (string)$manifest['version']);
+            return;
+        }
+
+        foreach ((array)glob($target . '.shards.*', GLOB_ONLYDIR) as $directory) {
+            $suffix = substr($directory, strlen($target . '.shards.'));
+            $modified_at = filemtime($directory);
+            if (preg_match('/^[a-f0-9]{16}$/D', (string)$suffix) === 1
+                && $modified_at !== false
+                && $modified_at < $cutoff) {
+                self::remove_blacklist_shard_directory($directory);
+            }
+        }
+    }
+
+    /**
+     * Remove a generated shard directory containing only flat JSON files.
+     *
+     * @param string $directory Generated shard directory.
+     * @return void
+     */
+    private static function remove_blacklist_shard_directory($directory) {
+        if (!is_dir($directory)) {
+            return;
+        }
+        foreach ((array)glob($directory . DIRECTORY_SEPARATOR . '*.json') as $file) {
+            if (is_file($file) && !unlink($file)) {
+                self::log_runtime_error('Unable to remove obsolete blacklist shard: ' . $file);
+                return;
+            }
+        }
+        if (!rmdir($directory)) {
+            self::log_runtime_error('Unable to remove obsolete blacklist shard directory: ' . $directory);
+        }
+    }
+
+    /**
      * Accept only non-empty JSON objects containing known blacklist sections.
      *
      * @param string|false $json Downloaded JSON document.
+     * @param array|null $decoded_data Validated decoded document.
      * @return bool
      */
-    private static function is_valid_blacklist_json($json) {
+    private static function is_valid_blacklist_json($json, &$decoded_data = null) {
+        $decoded_data = null;
         if (!is_string($json) || trim($json) === '') {
             return false;
         }
@@ -2151,7 +2890,12 @@ class lykan {
             }
         }
 
-        return $validated_entries > 0;
+        if ($validated_entries === 0) {
+            return false;
+        }
+
+        $decoded_data = $data;
+        return true;
     }
 
     /**
@@ -2234,7 +2978,15 @@ class lykan {
         if (!self::is_valid_blacklist_sql_entry($entry, $key)) {
             return false;
         }
-        return @preg_match((string)$entry['i_term'], '') !== false;
+        $pattern = (string)$entry['i_term'];
+        $max_pattern = max(32, (int)(lykan_config::$config['remote_regex_max_pattern_bytes'] ?? 512));
+        if (strlen($pattern) > $max_pattern) {
+            return false;
+        }
+        $limited_pattern = substr($pattern, 0, 1)
+            . '(*LIMIT_MATCH=100000)(*LIMIT_DEPTH=1000)'
+            . substr($pattern, 1);
+        return @preg_match($limited_pattern, '') !== false && preg_last_error() === PREG_NO_ERROR;
     }
 
     /**
@@ -2480,7 +3232,7 @@ class lykan_exploit {
 
         if (!empty(static::$queryString)) {
             if (self::contains_base64encode(static::$queryString) || self::contains_script_tag(static::$queryString) || self::contains_global_variable(static::$queryString) ||
-                self::contains_request_variable(static::$queryString) || self::contains_http_in_query(static::$queryString)) {
+                self::contains_request_variable(static::$queryString)) {
                 self::deny_access();
             }
         }
@@ -2503,7 +3255,7 @@ class lykan_exploit {
      * @return bool
      */
     private static function contains_script_tag($query) {
-        return preg_match('/<s*cript.*>|%3Cs*cript.*%3E/i', $query);
+        return preg_match('/<\s*script\b[^>]*>|%3C(?:%20)*script\b.*?%3E/i', $query);
     }
 
     /**
@@ -2524,16 +3276,6 @@ class lykan_exploit {
      */
     private static function contains_request_variable($query) {
         return preg_match('/_REQUEST(=|\[|\%[0-9A-Z]{0,2})/', $query);
-    }
-
-    /**
-     * Check for unencrypted HTTP URLs in the query string.
-     *
-     * @param string $query Query string to inspect.
-     * @return bool
-     */
-    private static function contains_http_in_query($query) {
-        return strpos($query, 'http:') !== false || strpos($query, 'http:%') !== false;
     }
 
     /**
