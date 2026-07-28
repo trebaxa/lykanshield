@@ -1,0 +1,54 @@
+name: WordPress Plugin Tests
+
+on:
+  push:
+    paths:
+      - "wordpress/lykanshield/**"
+      - ".github/workflows/wordpress-plugin-tests.yml"
+  pull_request:
+    paths:
+      - "wordpress/lykanshield/**"
+      - ".github/workflows/wordpress-plugin-tests.yml"
+
+jobs:
+  phpunit:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.2", "8.3", "8.4"]
+        wordpress: ["6.4", "6.5", "6.6", "latest"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: json, mbstring, pcre, sodium
+          coverage: none
+
+      - name: Validate Composer config
+        working-directory: wordpress/lykanshield
+        run: composer validate --strict
+
+      - name: Install dependencies
+        working-directory: wordpress/lykanshield
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: PHP syntax
+        working-directory: wordpress/lykanshield
+        run: find . -name "*.php" -not -path "./vendor/*" -print0 | xargs -0 -n1 php -l
+
+      - name: Smoke tests
+        working-directory: wordpress/lykanshield
+        run: composer run test:smoke
+
+      - name: PHPUnit
+        working-directory: wordpress/lykanshield
+        env:
+          WP_VERSION: ${{ matrix.wordpress }}
+        run: composer test

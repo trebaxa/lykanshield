@@ -1,0 +1,22 @@
+{
+  "name": "lykanshield/wordpress-plugin",
+  "description": "WordPress integration plugin for LykanShield.",
+  "type": "wordpress-plugin",
+  "license": "GPL-3.0-or-later",
+  "require": {
+    "php": ">=8.2"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5 || ^11.0"
+  },
+  "scripts": {
+    "test": "phpunit -c phpunit.xml.dist",
+    "test:smoke": [
+      "php tests/domain-resolver-smoke.php",
+      "php tests/core-config-smoke.php",
+      "php tests/license-status-smoke.php",
+      "php tests/license-token-smoke.php",
+      "php tests/multisite-smoke.php"
+    ]
+  }
+}

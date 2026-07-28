@@ -6,7 +6,7 @@ declare(strict_types=1);
  * lykan class
  *
  * @see       https://github.com/trebaxa/lykanshield
- * @version   2.0  
+ * @version   2.0
  * @requires  PHP 8.2 or newer
  * @author    Harald Petrich <service@trebaxa.com>
  * @copyright 2018 - 2026 Harald Petrich
@@ -40,6 +40,19 @@ class lykan_config {
         'blacklist_lifetime_hours' => 1, #locale blocked IPs life time
         'log_lines_count' => 98,
         'email' => '', #mail to send an info about sql injection attack
+        'subscription_plan' => 'free',
+        'subscription_domain' => '',
+        'license_entitlement' => array(),
+        'analytics_max_days' => 1,
+        'analytics_leaderboard_limit' => 10,
+        'api_daily_limit' => 100,
+        'custom_list_max_entries' => 100,
+        'lykan_capabilities' => array(),
+        'allowed_ips' => array(),
+        'custom_rules' => array(),
+        'notification_mode' => 'daily',
+        'webhook_url' => '',
+        'webhook_secret' => '',
         'trusted_proxies' => array(), # exact IP addresses or CIDR ranges
         'client_connect_timeout_seconds' => 10,
         'client_timeout_seconds' => 30,
@@ -99,8 +112,16 @@ class lykan {
     private static bool $response_finished = false;
 
     /**
+     * Unknown capabilities are denied by default.
+     */
+    public static function has_capability(string $capability): bool {
+        $capabilities = (array)(lykan_config::$config['lykan_capabilities'] ?? array());
+        return isset($capabilities[$capability]) && $capabilities[$capability] === true;
+    }
+
+    /**
      * lykan::auto_detect_system()
-     * 
+     *
      * @return void
      */
     protected static function auto_detect_system() {
@@ -213,7 +234,7 @@ class lykan {
 
     /**
      * lykan::get_the_ip()
-     * 
+     *
      * @return string
      */
     public static function get_the_ip(): string {
@@ -860,6 +881,10 @@ class lykan {
         self::ensure_initialized($path);
         self::maybe_cleanup_request_cache();
 
+        if (self::client_is_allowlisted()) {
+            return;
+        }
+
         $user_agent = self::get_user_agent();
         $identity = (stripos($user_agent, 'bot') !== false) ? $user_agent : $user_agent . self::get_the_ip();
         $bucket_count = max(16, min(65536, (int)(lykan_config::$config['request_cache_bucket_count'] ?? 1024)));
@@ -887,6 +912,7 @@ class lykan {
         self::file_upload_protection();
         self::block_bad_bots();
         self::block_locale_bad_ips();
+        self::apply_custom_rules();
         self::worm_detect();
         self::sql_detect();
         self::clear_blocked();
@@ -910,6 +936,63 @@ class lykan {
          *     die();
          * }
         */
+    }
+
+    /**
+     * Allow exact IPs and CIDR ranges to bypass request blocking.
+     */
+    private static function client_is_allowlisted(): bool {
+        $client_ip = self::get_the_ip();
+        foreach ((array)(lykan_config::$config['allowed_ips'] ?? array()) as $entry) {
+            $entry = trim((string)$entry);
+            if (
+                (filter_var($entry, FILTER_VALIDATE_IP) && $entry === $client_ip)
+                || (self::is_valid_cidr($entry) && self::ip_matches_cidr($client_ip, $entry))
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Apply locally configured Premium request rules.
+     */
+    private static function apply_custom_rules(): void {
+        if (!self::has_capability('extended_rules')) {
+            return;
+        }
+        $sources = array(
+            'uri' => (string)($_SERVER['REQUEST_URI'] ?? ''),
+            'query' => self::get_query_string(),
+            'user_agent' => self::get_user_agent(),
+        );
+        foreach (array_slice((array)(lykan_config::$config['custom_rules'] ?? array()), 0, 250) as $rule) {
+            if (!is_array($rule) || empty($rule['enabled'])) {
+                continue;
+            }
+            $target = (string)($rule['target'] ?? 'query');
+            $source = (string)($sources[$target] ?? '');
+            $pattern = substr((string)($rule['pattern'] ?? ''), 0, 512);
+            if ($pattern === '') {
+                continue;
+            }
+            $matches = ($rule['match'] ?? 'contains') === 'regex'
+                ? @preg_match($pattern, $source) === 1
+                : stripos($source, $pattern) !== false;
+            if (!$matches) {
+                continue;
+            }
+            $name = substr(
+                preg_replace('/[^a-z0-9_. -]+/i', '', (string)($rule['name'] ?? 'Custom rule')),
+                0,
+                80
+            );
+            self::report_hack('CUSTOM_RULE', $name, true);
+            if (($rule['action'] ?? 'log') === 'block') {
+                self::exit_env('CUSTOM_RULE: ' . $name);
+            }
+        }
     }
 
     /**
@@ -962,7 +1045,7 @@ class lykan {
 
     /**
      * lykan::payloadlog()
-     * 
+     *
      * @return void
      */
     protected static function payloadlog() {
@@ -1453,8 +1536,8 @@ class lykan {
             }
         }
         arsort($records, SORT_NUMERIC);
-        $max_entries = max(1, (int)(lykan_config::$config['local_bad_ip_max_entries'] ?? 5000));
-        return array_slice($records, 0, $max_entries, true);
+        $max_entries = (int)(lykan_config::$config['local_bad_ip_max_entries'] ?? 5000);
+        return $max_entries > 0 ? array_slice($records, 0, $max_entries, true) : $records;
     }
 
     /**
@@ -2107,8 +2190,77 @@ class lykan {
         });
         if ($queued) {
             self::schedule_report_queue_flush();
+            self::schedule_premium_notification($event);
         }
         return $queued;
+    }
+
+    private static function schedule_premium_notification(array $event): void {
+        if (!self::has_capability('instant_notifications')
+            || (lykan_config::$config['notification_mode'] ?? '') !== 'instant') {
+            return;
+        }
+        register_shutdown_function(function () use ($event) {
+            self::finish_response_once();
+            $form = (array)($event['FORM'] ?? array());
+            $email = trim((string)(lykan_config::$config['email'] ?? ''));
+            if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $subject = 'LykanShield: ' . ($form['type'] ?? 'Sicherheitsereignis');
+                $body = "Domain: " . ($form['domain'] ?? '') . PHP_EOL
+                    . "Typ: " . ($form['type'] ?? '') . PHP_EOL
+                    . "IP: " . ($form['ip'] ?? '') . PHP_EOL
+                    . "Zeit: " . date('c', (int)($form['reported_at'] ?? time()));
+                @mail($email, $subject, $body);
+            }
+            self::send_premium_webhook($event);
+        });
+    }
+
+    public static function send_premium_webhook(array $event): bool {
+        if (!self::has_capability('webhooks') || !function_exists('curl_init')) {
+            return false;
+        }
+        $url = trim((string)(lykan_config::$config['webhook_url'] ?? ''));
+        $parts = parse_url($url);
+        if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https'
+            || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])
+            || (isset($parts['port']) && (int)$parts['port'] !== 443)) {
+            return false;
+        }
+        $ips = gethostbynamel((string)$parts['host']);
+        if (!is_array($ips) || count($ips) === 0) {
+            return false;
+        }
+        foreach ($ips as $ip) {
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return false;
+            }
+        }
+        $payload = json_encode($event, JSON_UNESCAPED_SLASHES);
+        if (!is_string($payload)) {
+            return false;
+        }
+        $secret = (string)(lykan_config::$config['webhook_secret'] ?? '');
+        $headers = array(
+            'Content-Type: application/json',
+            'X-LykanShield-Signature: sha256=' . hash_hmac('sha256', $payload, $secret),
+        );
+        $curl = curl_init($url);
+        curl_setopt_array($curl, array(
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_TIMEOUT => 5,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_RESOLVE => array($parts['host'] . ':443:' . $ips[0]),
+        ));
+        curl_exec($curl);
+        $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+        curl_close($curl);
+        return $status >= 200 && $status < 300;
     }
 
     /**
@@ -2206,7 +2358,7 @@ class lykan {
 
     /**
      * lykan::get_lock()
-     * 
+     *
      * @param mixed $days
      * @param integer $limit
      * @return array|null
@@ -2214,18 +2366,72 @@ class lykan {
     public static function get_lock(int $days, int $limit = 0): ?array {
         self::ensure_initialized();
         $domain = self::get_host();
-        $days = (int)$days;
+        $days = max(1, min($days, (int)(lykan_config::$config['analytics_max_days'] ?? 1)));
+        $max_limit = max(1, (int)(lykan_config::$config['analytics_leaderboard_limit'] ?? 10));
+        $limit = $limit > 0 ? min($limit, $max_limit) : $max_limit;
         $arr = array(
             'cmd' => 'get_lock',
+            'd' => $domain,
             'days' => $days,
-            'limit' => (int)$limit,
-            'domain' => $domain,
-            'khash' => hash('sha256', $domain . $days . lykan::get_timestamp()));
-        $str = lykan_client::call('POST', $arr);
+            'limit' => $limit,
+            'hash' => hash('sha256', $domain . $days . lykan::get_timestamp()));
+        $str = lykan_client::call('FORM', $arr);
         if (!is_string($str)) {
             return null;
         }
         $decoded = json_decode($str, true);
+        if (!is_array($decoded)
+            || isset($decoded['error'])
+            || isset($decoded['msge'])
+            || (isset($decoded['status']) && $decoded['status'] === false)
+            || !isset($decoded['data'], $decoded['summary'])
+            || !is_array($decoded['data'])
+            || !is_array($decoded['summary'])) {
+            return null;
+        }
+        return $decoded;
+    }
+
+    public static function get_ip_history(string $ip, int $days = 365): ?array {
+        self::ensure_initialized();
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+            return null;
+        }
+        $domain = self::get_host();
+        $days = max(1, min($days, (int)(lykan_config::$config['analytics_max_days'] ?? 1)));
+        $str = lykan_client::call('POST', array(
+            'cmd' => 'get_ip_history',
+            'days' => $days,
+            'ip' => $ip,
+            'domain' => $domain,
+            'khash' => hash('sha256', $domain . $days . strtolower($ip) . self::get_timestamp()),
+        ));
+        $decoded = is_string($str) ? json_decode($str, true) : null;
+        return is_array($decoded) ? $decoded : null;
+    }
+
+    public static function get_dimension_history(
+        string $dimension,
+        string $value = '',
+        int $days = 31
+    ): ?array {
+        self::ensure_initialized();
+        $dimension = $dimension === 'type' ? 'type' : 'country';
+        $value = substr(trim($value), 0, 190);
+        $domain = self::get_host();
+        $days = max(1, min($days, (int)(lykan_config::$config['analytics_max_days'] ?? 1)));
+        $str = lykan_client::call('POST', array(
+            'cmd' => $dimension === 'type' ? 'get_type_history' : 'get_country_history',
+            'days' => $days,
+            'dimension' => $dimension,
+            'value' => $value,
+            'domain' => $domain,
+            'khash' => hash(
+                'sha256',
+                $domain . $days . $dimension . $value . self::get_timestamp()
+            ),
+        ));
+        $decoded = is_string($str) ? json_decode($str, true) : null;
         return is_array($decoded) ? $decoded : null;
     }
 
@@ -3050,14 +3256,14 @@ class lykan_client {
     /**
      * Send a hardened HTTPS request to the Lykan service.
      *
-     * @param string $method GET, POST or DOWNLOAD.
+     * @param string $method GET, POST, FORM or DOWNLOAD.
      * @param array $data Request payload.
      * @param string $local_file Download destination for DOWNLOAD requests.
      * @return string|bool Response body, download status or false on failure.
      */
     public static function call(string $method, array $data, string $local_file = ''): string|bool {
         $method = strtoupper(trim((string)$method));
-        if (!in_array($method, array('GET', 'POST', 'DOWNLOAD'), true)) {
+        if (!in_array($method, array('GET', 'POST', 'FORM', 'DOWNLOAD'), true)) {
             self::append_error_log('Unsupported Lykan HTTP method: ' . $method);
             return false;
         }
@@ -3066,6 +3272,7 @@ class lykan_client {
             return false;
         }
 
+        $is_form_request = $method === 'FORM';
         $url = static::$endpoint;
         $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
         if ($scheme !== 'https') {
@@ -3073,9 +3280,15 @@ class lykan_client {
             return false;
         }
 
-        $data['apikey'] = (lykan_config::$config['apikey'] != "") ? lykan_config::$config['apikey'] : "";
-        $data['host'] = lykan::get_host();
-        $data['hash'] = hash('sha512', implode(':', [$data['apikey'], $data['host'], lykan::get_timestamp()]));
+        if (!$is_form_request) {
+            $data['apikey'] = (lykan_config::$config['apikey'] != "") ? lykan_config::$config['apikey'] : "";
+            $data['host'] = lykan::get_host();
+            $entitlement = (array)(lykan_config::$config['license_entitlement'] ?? array());
+            if (!empty($entitlement['signature'])) {
+                $data['entitlement'] = $entitlement;
+            }
+            $data['hash'] = hash('sha512', implode(':', [$data['apikey'], $data['host'], lykan::get_timestamp()]));
+        }
         if ($method === 'GET') {
             $query = http_build_query($data, '', '&', PHP_QUERY_RFC3986);
             $url .= (strpos($url, '?') === false ? '?' : '&') . $query;
@@ -3109,7 +3322,9 @@ class lykan_client {
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HEADER => false,
             CURLOPT_HTTPHEADER => array(
-                'Content-Type: application/json',
+                'Content-Type: ' . ($is_form_request
+                    ? 'application/x-www-form-urlencoded'
+                    : 'application/json'),
                 'Accept: application/json',
                 'Cache-Control: no-cache, no-store, must-revalidate'
             )
@@ -3123,6 +3338,16 @@ class lykan_client {
 
         $fp = null;
         switch ($method) {
+            case 'FORM':
+                $options[CURLOPT_POST] = true;
+                $options[CURLOPT_RETURNTRANSFER] = true;
+                $options[CURLOPT_POSTFIELDS] = http_build_query(
+                    $data,
+                    '',
+                    '&',
+                    PHP_QUERY_RFC3986
+                );
+                break;
             case 'POST':
                 $options[CURLOPT_POST] = true;
                 $options[CURLOPT_RETURNTRANSFER] = true;
@@ -3171,6 +3396,7 @@ class lykan_client {
         $result = curl_exec($curl);
         $curl_error = curl_error($curl);
         $http_code = (int)curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        $content_type = strtolower((string)curl_getinfo($curl, CURLINFO_CONTENT_TYPE));
         curl_close($curl);
         if (is_resource($fp)) {
             fflush($fp);
@@ -3179,7 +3405,10 @@ class lykan_client {
 
         // Only explicit HTTP success responses are accepted. Redirects are
         // rejected so the client never sends credentials to another endpoint.
-        $is_failure = ($result === false) || $http_code < 200 || $http_code >= 300;
+        $is_failure = ($result === false)
+            || $http_code < 200
+            || $http_code >= 300
+            || ($is_form_request && strpos($content_type, 'application/json') === false);
         if ($is_failure) {
             if ($method === 'DOWNLOAD' && !empty($local_file) && is_file($local_file)) {
                 if (!unlink($local_file)) {
@@ -3192,6 +3421,9 @@ class lykan_client {
             }
             elseif ($http_code > 0) {
                 $log_msg .= ': HTTP ' . $http_code;
+                if ($is_form_request && strpos($content_type, 'application/json') === false) {
+                    $log_msg .= ', unexpected content type ' . ($content_type !== '' ? $content_type : 'unknown');
+                }
             }
             else {
                 $log_msg .= ': no HTTP response';

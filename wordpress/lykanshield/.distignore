@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+dist
+tests
+scripts
+*.log
+*.tmp
+*.cache
+*.pem
+*.key
+.env
+.env.*
