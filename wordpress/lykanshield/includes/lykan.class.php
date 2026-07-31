@@ -35,6 +35,7 @@ declare(strict_types=1);
 
 class lykan_config {
     public static array $config = array(
+        'lykan_enabled' => 1, # enabled unless explicitly disabled in firewall settings
         'apikey' => '', # from lykanshield.io, not needed for protection
         'hcache_lifetime_hours' => 3, # cache lifetime in hours of filter files
         'blacklist_lifetime_hours' => 1, #locale blocked IPs life time
@@ -110,7 +111,7 @@ class lykan {
     private static bool $config_loaded = false;
     private static bool $rule_refresh_scheduled = false;
     private static bool $response_finished = false;
-
+    private static array $reported_attack_types = array();
     /**
      * Unknown capabilities are denied by default.
      */
@@ -873,13 +874,166 @@ class lykan {
     }
 
     /**
+     * Remove all generated blacklist and host-specific Lykan cache files.
+     *
+     * This is the single cleanup entry point used by both the firewall UI and
+     * the CMS updater.
+     *
+     * @return array{status:string,removed:int,failed:int}
+     */
+    public static function clear_generated_cache(): array {
+        self::ensure_initialized();
+
+        $result = array(
+            'status' => 'success',
+            'removed' => 0,
+            'failed' => 0
+        );
+        $blacklist_path = (string)(lykan_config::$config['lykan_blacklist'] ?? '');
+        $lykan_dir = $blacklist_path !== '' ? realpath(dirname($blacklist_path)) : false;
+        if ($lykan_dir === false || !is_dir($lykan_dir)) {
+            $result['status'] = 'missing';
+            return $result;
+        }
+
+        $lock_file = $blacklist_path . '.lock';
+        $lock_handle = @fopen($lock_file, 'x');
+        if ($lock_handle === false) {
+            $result['status'] = 'locked';
+            return $result;
+        }
+        fwrite($lock_handle, getmypid() . "\t" . time() . "\tcache-reset");
+        fflush($lock_handle);
+
+        foreach (array(
+            $blacklist_path,
+            $blacklist_path . '.shards.json',
+            $lykan_dir . DIRECTORY_SEPARATOR . 'lykan_error.log'
+        ) as $file) {
+            self::remove_generated_cache_file($file, $result);
+        }
+
+        foreach (array('badips_*.txt', 'badbots_*.txt', 'hacklogblock_*.txt') as $pattern) {
+            foreach ((array)glob($lykan_dir . DIRECTORY_SEPARATOR . $pattern) as $file) {
+                if (preg_match(
+                    '/^(?:badips|badbots|hacklogblock)_[A-Za-z0-9._-]+\.txt$/D',
+                    basename($file)
+                )) {
+                    self::remove_generated_cache_file($file, $result);
+                }
+            }
+        }
+
+        $shard_name_pattern = '/^'
+            . preg_quote(basename($blacklist_path), '/')
+            . '\.shards\.[a-f0-9]{16}$/D';
+        foreach ((array)glob($blacklist_path . '.shards.*', GLOB_ONLYDIR) as $directory) {
+            if (preg_match($shard_name_pattern, basename($directory)) !== 1) {
+                continue;
+            }
+            if (self::remove_generated_cache_directory($directory, $lykan_dir)) {
+                $result['removed']++;
+            }
+            else {
+                $result['failed']++;
+            }
+        }
+
+        fclose($lock_handle);
+        if (is_file($lock_file) && !unlink($lock_file)) {
+            $result['failed']++;
+        }
+        if ($result['failed'] > 0) {
+            $result['status'] = 'partial';
+        }
+
+        self::reset_blacklist_cache($blacklist_path);
+        return $result;
+    }
+
+    /**
+     * Remove one generated cache file and update cleanup statistics.
+     *
+     * @param string $file Cache file.
+     * @param array{status:string,removed:int,failed:int} $result Cleanup result.
+     * @return void
+     */
+    private static function remove_generated_cache_file(string $file, array &$result): void {
+        if (!is_file($file)) {
+            return;
+        }
+        if (unlink($file)) {
+            $result['removed']++;
+        }
+        else {
+            $result['failed']++;
+        }
+    }
+
+    /**
+     * Remove a validated flat shard directory below the Lykan data directory.
+     *
+     * @param string $directory Shard directory.
+     * @param string $lykan_dir Resolved Lykan data directory.
+     * @return bool
+     */
+    private static function remove_generated_cache_directory(
+        string $directory,
+        string $lykan_dir
+    ): bool {
+        $resolved = realpath($directory);
+        $root = rtrim($lykan_dir, '\\/') . DIRECTORY_SEPARATOR;
+        if ($resolved === false
+            || strpos(rtrim($resolved, '\\/') . DIRECTORY_SEPARATOR, $root) !== 0) {
+            return false;
+        }
+
+        foreach ((array)scandir($resolved) as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $path = $resolved . DIRECTORY_SEPARATOR . $entry;
+            if (!is_file($path) || !unlink($path)) {
+                return false;
+            }
+        }
+        return rmdir($resolved);
+    }
+
+    /**
      * lykan::run()
      * 
      * @return void
      */
     public static function run(string $path = ''): void {
         self::ensure_initialized($path);
+
+        // Fail secure for existing installations: a missing, malformed or
+        // unknown value keeps LykanShield enabled. Only an explicitly saved
+        // integer/string zero disables request filtering.
+        if (
+            array_key_exists('lykan_enabled', lykan_config::$config)
+            && (
+                lykan_config::$config['lykan_enabled'] === 0
+                || lykan_config::$config['lykan_enabled'] === '0'
+            )
+        ) {
+            return;
+        }
+
         self::maybe_cleanup_request_cache();
+        self::schedule_stale_rule_refresh();
+
+        // The central Lykan service protects itself with LykanShield. Its
+        // authenticated API must reach the khacklog dispatcher before request
+        // payloads (including base64 encoded attack reports) are inspected by
+        // the generic website firewall. Keep this exception deliberately
+        // narrow: only the exact REST route, known commands and their expected
+        // HTTP methods qualify. Unknown commands and subpaths continue through
+        // every firewall detector below.
+        if (self::is_valid_service_rest_request()) {
+            return;
+        }
 
         if (self::client_is_allowlisted()) {
             return;
@@ -936,6 +1090,100 @@ class lykan {
          *     die();
          * }
         */
+    }
+
+    /**
+     * Recognize a protocol-valid request to the central khacklog REST service.
+     *
+     * Authentication, request hashes, entitlements and command parameters are
+     * still validated by khacklog_class::run_server(). This method only keeps
+     * the generic website firewall from classifying its own API protocol as a
+     * website attack before that dispatcher can run.
+     */
+    private static function is_valid_service_rest_request(): bool {
+        $request_uri = (string)($_SERVER['REQUEST_URI'] ?? '');
+        $path = parse_url($request_uri, PHP_URL_PATH);
+        if (!is_string($path) || !in_array($path, array('/rest', '/rest/'), true)) {
+            return false;
+        }
+
+        $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+        $cmd = '';
+
+        if ($method === 'GET') {
+            $cmd = is_scalar($_GET['cmd'] ?? null) ? (string)$_GET['cmd'] : '';
+        }
+        elseif ($method === 'POST') {
+            $content_type = strtolower(trim((string)(
+                $_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? ''
+            )));
+
+            if (strpos($content_type, 'application/json') === 0) {
+                $raw_body = file_get_contents('php://input');
+                $params = is_string($raw_body) ? json_decode($raw_body, true) : null;
+                $cmd = is_array($params) && is_scalar($params['cmd'] ?? null)
+                    ? (string)$params['cmd']
+                    : '';
+            }
+            elseif (
+                $content_type === ''
+                || strpos($content_type, 'application/x-www-form-urlencoded') === 0
+            ) {
+                $cmd = is_scalar($_POST['cmd'] ?? null) ? (string)$_POST['cmd'] : '';
+            }
+            else {
+                return false;
+            }
+        }
+        else {
+            return false;
+        }
+
+        $methods_by_command = array(
+            // Public blacklist compatibility endpoint.
+            'get_black_iplist' => array('GET', 'POST'),
+            // Historic dashboard/report commands remain supported.
+            'get_lock' => array('POST'),
+            'report_hack' => array('POST'),
+            // Current dashboard/report commands.
+            'get_lock_v2' => array('POST'),
+            'report_hack_v2' => array('POST'),
+            'get_ip_history' => array('POST'),
+            'get_country_history' => array('POST'),
+            'get_type_history' => array('POST'),
+        );
+
+        return isset($methods_by_command[$cmd])
+            && in_array($method, $methods_by_command[$cmd], true);
+    }
+
+    /**
+     * Let normal browser traffic keep the central rules current.
+     *
+     * This deliberately uses only file metadata in the request path. The
+     * network download runs in the shutdown handler and is protected by the
+     * cross-process refresh lock.
+     */
+    private static function schedule_stale_rule_refresh(): void {
+        $target = (string)(lykan_config::$config['lykan_blacklist'] ?? '');
+        if ($target === '') {
+            return;
+        }
+
+        $lifetime_seconds = max(
+            0.0,
+            (float)(lykan_config::$config['blacklist_lifetime_hours'] ?? 1)
+        ) * 3600;
+        $modified_at = is_file($target) ? filemtime($target) : false;
+        $size = is_file($target) ? filesize($target) : false;
+        $refresh_due = $modified_at === false
+            || $size === false
+            || $size <= 2
+            || (time() - $modified_at) > $lifetime_seconds;
+
+        if ($refresh_due) {
+            self::schedule_rule_refresh();
+        }
     }
 
     /**
@@ -1248,6 +1496,8 @@ class lykan {
      * @return void
      */
     public static function exit_env(string $reason = ''): never {
+        self::log_block_reason($reason);
+        self::report_blocked_request_if_needed($reason);
         if (!headers_sent()) {
             http_response_code(403);
             header('Content-Type: text/plain; charset=UTF-8');
@@ -1257,6 +1507,70 @@ class lykan {
 
         echo 'Forbidden';
         exit;
+    }
+
+    /**
+     * Persist a minimal block reason for production troubleshooting. Never log
+     * query strings, POST data, cookies or authorization values here.
+     */
+    private static function log_block_reason(string $reason): void {
+        $reason = substr(
+            preg_replace('/[^a-z0-9_.: -]+/i', '', trim($reason)),
+            0,
+            160
+        );
+        $method = substr(
+            preg_replace('/[^A-Z]+/', '', strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? ''))),
+            0,
+            10
+        );
+        $path = (string)parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
+        $path = substr(preg_replace('/[\x00-\x1F\x7F]+/', '', $path), 0, 500);
+        $entry = date('c')
+            . "\tBLOCK"
+            . "\treason=" . ($reason !== '' ? $reason : 'UNKNOWN')
+            . "\tmethod=" . ($method !== '' ? $method : 'UNKNOWN')
+            . "\tpath=" . $path
+            . "\tip=" . self::get_the_ip();
+
+        self::update_locked_file(
+            rtrim(self::get_root(), '/\\') . DIRECTORY_SEPARATOR . 'lykan_error.log',
+            function ($current) use ($entry) {
+                $lines = preg_split('/\R/', trim((string)$current), -1, PREG_SPLIT_NO_EMPTY);
+                $lines[] = $entry;
+                return implode(PHP_EOL, array_slice($lines, -100)) . PHP_EOL;
+            }
+        );
+    }
+
+    /**
+     * Guarantee that every attack-related 403 has a queued central report.
+     *
+     * Most detectors report richer details before calling exit_env(). This is
+     * the safety net for exceptional validation paths and deliberately avoids
+     * duplicate reports of the same type during one request.
+     */
+    private static function report_blocked_request_if_needed(string $reason): void {
+        $reason = trim($reason);
+        if ($reason === '' || strpos($reason, 'RULES_UNAVAILABLE') === 0) {
+            return;
+        }
+
+        $token = strtoupper((string)preg_split('/[\s:]+/', $reason, 2)[0]);
+        $aliases = array(
+            'INJECT' => lykan_types::SQL_INJECT,
+            'BOT' => lykan_types::BLACK_LIST_BOT,
+            'USER_AGENT' => lykan_types::INVALID_USER_AGENT,
+        );
+        $type = (string)($aliases[$token] ?? $token);
+        if ($type === '') {
+            $type = lykan_types::STD;
+        }
+        if (isset(self::$reported_attack_types[$type])) {
+            return;
+        }
+
+        self::report_hack($type, substr($reason, 0, 500), false);
     }
 
 
@@ -1776,6 +2090,25 @@ class lykan {
                 $lc_variants[] = self::lower_utf8($v);
             }
 
+            // High-confidence SQL structures must be detected even when the
+            // remotely maintained sqlinject list is missing, empty or stale.
+            // Previously the heuristic score was only calculated after a
+            // substring from that list had matched, which could effectively
+            // disable SQL protection on an otherwise identical installation.
+            foreach (array_values(array_unique($lc_variants)) as $v) {
+                $structural_score = self::score_sql_injection_candidate($v, '');
+                if ($structural_score >= 3) {
+                    $detections[] = array(
+                        'type' => 'structural',
+                        'reason' => 'built-in SQL structure heuristic',
+                        'matched_variant' => substr($v, 0, 200),
+                        'value_snippet' => substr($s_trim, 0, 120),
+                        'score' => $structural_score
+                    );
+                    break;
+                }
+            }
+
             // 2) pattern matching (plain substring, case-insensitive)
             foreach ($lc_patterns as $idx => $pattern) {
                 if ($pattern === '')
@@ -2158,19 +2491,28 @@ class lykan {
      */
     public static function report_hack(string $h_type, string $h_type_info = '', bool $adddb = true): bool {
         self::ensure_initialized();
+        $normalized_type = substr((string)$h_type, 0, 100);
         $type_info = preg_replace('/[\r\n\t\0]+/', ' ', (string)$h_type_info);
         $event = array(
-            'cmd' => 'report_hack',
+            'cmd' => 'report_hack_v2',
             'adddb' => (bool)$adddb,
             'user_agent' => self::get_user_agent(),
             'FORM' => array(
-                'type' => substr((string)$h_type, 0, 100),
+                'type' => $normalized_type,
                 'type_info' => substr(trim((string)$type_info), 0, 500),
                 'domain' => self::get_host(),
                 'ip' => self::get_the_ip(),
-                'url' => isset($_SERVER['PHP_SELF'])
-                    ? substr((string)$_SERVER['PHP_SELF'], 0, 500)
-                    : '',
+                // Keep the historic transport format. The protected request
+                // must not appear as plain text in the POST body because the
+                // receiving LykanShield installation protects its own API as
+                // well and could otherwise classify the report as an attack.
+                'url' => base64_encode(
+                    substr((string)($_SERVER['PHP_SELF'] ?? ''), 0, 500)
+                    . '###'
+                    . substr((string)($_SERVER['QUERY_STRING'] ?? ''), 0, 2000)
+                    . '###'
+                    . substr(http_build_query($_REQUEST), 0, 4000)
+                ),
                 'reported_at' => time()
             )
         );
@@ -2189,6 +2531,7 @@ class lykan {
             return implode(PHP_EOL, $lines) . PHP_EOL;
         });
         if ($queued) {
+            self::$reported_attack_types[strtoupper($normalized_type)] = true;
             self::schedule_report_queue_flush();
             self::schedule_premium_notification($event);
         }
@@ -2294,9 +2637,27 @@ class lykan {
         $failed = array();
         foreach ($claimed as $line) {
             $event = json_decode($line, true);
-            if (!is_array($event) || ($event['cmd'] ?? '') !== 'report_hack') {
+            if (!is_array($event)
+                || !in_array(
+                    ($event['cmd'] ?? ''),
+                    array('report_hack', 'report_hack_v2'),
+                    true
+                )) {
                 self::log_runtime_error('Discarded an invalid hack-report queue entry.');
                 continue;
+            }
+            // Entries already queued before the endpoint split are upgraded
+            // locally; the legacy command remains reserved for old clients.
+            $event['cmd'] = 'report_hack_v2';
+            // Convert reports queued by the short-lived plain-URL client
+            // version before they leave this server.
+            $queued_url = (string)($event['FORM']['url'] ?? '');
+            $decoded_url = base64_decode($queued_url, true);
+            if ($queued_url !== ''
+                && (!is_string($decoded_url) || strpos($decoded_url, '###') === false)) {
+                $event['FORM']['url'] = base64_encode(
+                    substr($queued_url, 0, 500) . '######'
+                );
             }
             if (lykan_client::call('POST', $event) === false) {
                 $failed[] = $line;
@@ -2333,11 +2694,14 @@ class lykan {
      * @return void
      */
     private static function schedule_report_queue_flush() {
-        if (self::$report_flush_scheduled || !function_exists('fastcgi_finish_request')) {
+        if (self::$report_flush_scheduled) {
             return;
         }
         self::$report_flush_scheduled = true;
         register_shutdown_function(function () {
+            // fastcgi_finish_request() is an optimization, not a delivery
+            // requirement. Apache mod_php and several shared-hosting SAPIs do
+            // not provide it; their reports must still be flushed.
             self::finish_response_once();
             self::flush_report_queue(5);
         });
@@ -2370,7 +2734,7 @@ class lykan {
         $max_limit = max(1, (int)(lykan_config::$config['analytics_leaderboard_limit'] ?? 10));
         $limit = $limit > 0 ? min($limit, $max_limit) : $max_limit;
         $arr = array(
-            'cmd' => 'get_lock',
+            'cmd' => 'get_lock_v2',
             'd' => $domain,
             'days' => $days,
             'limit' => $limit,
@@ -2443,7 +2807,9 @@ class lykan {
     public static function get_current_pattern(): string {
         self::ensure_initialized();
         $path = lykan_config::$config['lykan_blacklist'];
-        $lifetime_hours = isset(lykan_config::$config['blacklist_lifetime_hours']) ? (int)lykan_config::$config['blacklist_lifetime_hours'] : 0;
+        $lifetime_hours = isset(lykan_config::$config['blacklist_lifetime_hours'])
+            ? max(0.0, (float)lykan_config::$config['blacklist_lifetime_hours'])
+            : 0.0;
 
         if (self::$blacklist_cache_path !== $path) {
             self::reset_blacklist_cache($path);
@@ -2559,18 +2925,42 @@ class lykan {
     }
 
     /**
+     * Run Lykan's recurring maintenance from the CMS cronjob.
+     */
+    public static function maintenance(string $path = ''): bool {
+        self::ensure_initialized($path);
+        self::cleanup_runtime_artifacts();
+
+        $target = (string)lykan_config::$config['lykan_blacklist'];
+        $lifetime_hours = max(
+            0.0,
+            (float)(lykan_config::$config['blacklist_lifetime_hours'] ?? 1)
+        );
+        $modified_at = is_file($target) ? filemtime($target) : false;
+        $refresh_due = $modified_at === false
+            || (time() - $modified_at) > ($lifetime_hours * 3600);
+        $refreshed = !$refresh_due || self::refresh_rules();
+
+        // A cronjob also delivers reports left behind by interrupted requests.
+        self::flush_report_queue(100);
+        return $refreshed;
+    }
+
+    /**
      * Schedule stale-rule refresh after a PHP-FPM response.
      *
      * @return void
      */
     private static function schedule_rule_refresh() {
         if (self::$rule_refresh_scheduled
-            || empty(lykan_config::$config['refresh_rules_after_response'])
-            || !function_exists('fastcgi_finish_request')) {
+            || empty(lykan_config::$config['refresh_rules_after_response'])) {
             return;
         }
         self::$rule_refresh_scheduled = true;
         register_shutdown_function(function () {
+            // fastcgi_finish_request() shortens the visible response where
+            // available, but rule updates must also work under mod_php and
+            // other SAPIs.
             self::finish_response_once();
             self::refresh_rules();
         });
@@ -2825,7 +3215,12 @@ class lykan {
 
         $data = array('cmd' => 'get_black_iplist');
         try {
-            if (lykan_client::call('DOWNLOAD', $data, $temp_file) !== true) {
+            // The public blacklist command is dispatched by the CMS router
+            // from URL parameters. Report delivery continues to use JSON POST,
+            // but the rule download must use an authenticated GET request.
+            $downloaded_json = lykan_client::call('GET', $data);
+            if (!is_string($downloaded_json)
+                || file_put_contents($temp_file, $downloaded_json, LOCK_EX) === false) {
                 return false;
             }
 
@@ -3083,7 +3478,8 @@ class lykan {
             'mime' => 'is_valid_blacklist_mime_entry',
             'xssinject' => 'is_valid_blacklist_regex_entry',
             'sqlinject' => 'is_valid_blacklist_sql_entry',
-            'worm' => 'is_valid_blacklist_regex_entry'
+            'sqlinjectregex' => 'is_valid_blacklist_regex_entry',
+            'worminject' => 'is_valid_blacklist_sql_entry'
         );
         $max_entries = max(1, (int)(lykan_config::$config['blacklist_max_entries_per_section'] ?? 50000));
         $validated_entries = 0;
@@ -3405,10 +3801,19 @@ class lykan_client {
 
         // Only explicit HTTP success responses are accepted. Redirects are
         // rejected so the client never sends credentials to another endpoint.
+        $expects_json = $method !== 'DOWNLOAD';
         $is_failure = ($result === false)
             || $http_code < 200
             || $http_code >= 300
-            || ($is_form_request && strpos($content_type, 'application/json') === false);
+            || ($expects_json && strpos($content_type, 'application/json') === false);
+        if (!$is_failure && $expects_json) {
+            $response_data = json_decode((string)$result, true);
+            if (!is_array($response_data)
+                || (array_key_exists('status', $response_data)
+                    && $response_data['status'] !== true)) {
+                $is_failure = true;
+            }
+        }
         if ($is_failure) {
             if ($method === 'DOWNLOAD' && !empty($local_file) && is_file($local_file)) {
                 if (!unlink($local_file)) {
@@ -3421,7 +3826,7 @@ class lykan_client {
             }
             elseif ($http_code > 0) {
                 $log_msg .= ': HTTP ' . $http_code;
-                if ($is_form_request && strpos($content_type, 'application/json') === false) {
+                if ($expects_json && strpos($content_type, 'application/json') === false) {
                     $log_msg .= ', unexpected content type ' . ($content_type !== '' ? $content_type : 'unknown');
                 }
             }
